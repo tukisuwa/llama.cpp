@@ -18,8 +18,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -114,6 +116,11 @@ public:
             int fd = -1;
             if (!log.empty()) {
                 fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) {
+                    dprintf(STDERR_FILENO, "failed to open O_DIRECT streamer log %s: %s; redirecting to /dev/null\n",
+                            log.c_str(), strerror(errno));
+                    fd = open("/dev/null", O_WRONLY);
+                }
             } else {
                 fd = open("/dev/null", O_WRONLY);
             }

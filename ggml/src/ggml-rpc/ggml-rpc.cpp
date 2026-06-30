@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <chrono>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
 #endif
 
@@ -264,11 +266,14 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
 }
 
 static uint64_t rpc_htonll(uint64_t v) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    static const bool is_little_endian = []() {
+        const uint16_t value = 1;
+        return *reinterpret_cast<const uint8_t *>(&value) == 1;
+    }();
+    if (!is_little_endian) {
+        return v;
+    }
     return (static_cast<uint64_t>(htonl(static_cast<uint32_t>(v))) << 32) | htonl(static_cast<uint32_t>(v >> 32));
-#else
-    return v;
-#endif
 }
 
 static uint64_t rpc_ntohll(uint64_t v) {

@@ -1,7 +1,9 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#ifdef GGML_USE_RPC
 #include "ggml-rpc.h"
+#endif
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1988,6 +1990,10 @@ bool llama_model_loader::load_all_data(
         }
     } async_upload_cleanup { host_buffers, events, upload_backend };
 
+    if (upload_backend == nullptr && (!host_buffers.empty() || !events.empty())) {
+        async_upload_cleanup.cleanup();
+    }
+
     if (upload_backend) {
         LLAMA_LOG_WARN("%s: using async uploads for device %s, buffer type %s, backend %s, staging buffers = %zu x %.2f MiB\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
@@ -2376,6 +2382,7 @@ bool llama_model_loader::load_all_data(
                     bool use_rpc_odirect_process_direct = false;
 #if defined(__linux__)
                     if (!check_tensors && rpc_odirect_process_direct && cur_is_rpc_buffer) {
+#ifdef GGML_USE_RPC
                         const size_t chunk_size = 64 * MiB;
                         void * aligned_read_raw = nullptr;
                         const size_t aligned_read_size = chunk_size + 4096;
@@ -2423,20 +2430,33 @@ bool llama_model_loader::load_all_data(
                         slice_counted_in_chunks = true;
                         slice_done += n_size;
                         uma_slice_gate();
+#else
+                        throw std::runtime_error(format("%s: RPC in-process O_DIRECT path requires GGML_USE_RPC", __func__));
+#endif
                     }
 #else
                     if (rpc_odirect_process_direct) {
                         throw std::runtime_error(format("%s: RPC in-process O_DIRECT path is unavailable on this platform", __func__));
                     }
 #endif
-                    const bool use_rpc_odirect_stream =
-                        !check_tensors &&
-                        !use_rpc_odirect_process_direct &&
-                        !rpc_odirect_process_direct &&
-                        rpc_odirect_stream_endpoint != nullptr &&
-                        rpc_odirect_stream_endpoint[0] != '\0' &&
-                        ggml_backend_rpc_buffer_set_tensor_from_file(
+                    bool use_rpc_odirect_stream = false;
+                    if (!check_tensors &&
+                            !use_rpc_odirect_process_direct &&
+                            !rpc_odirect_process_direct &&
+                            rpc_odirect_stream_endpoint != nullptr &&
+                            rpc_odirect_stream_endpoint[0] != '\0' &&
+                            cur_is_rpc_buffer) {
+#ifdef GGML_USE_RPC
+                        use_rpc_odirect_stream = ggml_backend_rpc_buffer_set_tensor_from_file(
                                 cur->buffer, cur, rpc_odirect_stream_endpoint, file->path().c_str(), weight->offs, 0, n_size);
+                        if (!use_rpc_odirect_stream) {
+                            throw std::runtime_error(format("%s: RPC O_DIRECT stream endpoint was requested but failed for tensor %s",
+                                        __func__, ggml_get_name(cur)));
+                        }
+#else
+                        throw std::runtime_error(format("%s: RPC O_DIRECT stream endpoint was requested but GGML_USE_RPC is disabled", __func__));
+#endif
+                    }
                     if (use_rpc_odirect_process_direct) {
                         // already streamed through the existing RPC connection above
                     } else if (use_rpc_odirect_stream) {
