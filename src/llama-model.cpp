@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -86,25 +87,38 @@ static llama_uma_buffer_load_order llama_model_env_load_order() {
     return LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
 }
 
-static uint64_t llama_model_memory_psi_total() {
+struct llama_model_psi_totals {
+    uint64_t some = 0;
+    uint64_t full = 0;
+};
+
+static llama_model_psi_totals llama_model_memory_psi_totals() {
     std::ifstream psi("/proc/pressure/memory");
     std::string line;
+    llama_model_psi_totals result;
     while (std::getline(psi, line)) {
-        if (line.rfind("some ", 0) != 0) {
+        const bool is_some = line.rfind("some ", 0) == 0;
+        const bool is_full = line.rfind("full ", 0) == 0;
+        if (!is_some && !is_full) {
             continue;
         }
         const std::string key = "total=";
         const size_t pos = line.find(key);
         if (pos == std::string::npos) {
-            return 0;
+            continue;
         }
         try {
-            return std::stoull(line.substr(pos + key.size()));
+            const uint64_t value = std::stoull(line.substr(pos + key.size()));
+            if (is_some) {
+                result.some = value;
+            } else {
+                result.full = value;
+            }
         } catch (...) {
-            return 0;
+            continue;
         }
     }
-    return 0;
+    return result;
 }
 
 static uint64_t llama_model_mem_available_bytes() {
@@ -1613,6 +1627,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_ERROR("%s: UMA backend buffer load ordering requires --uma-loader-safe and --no-mmap\n", __func__);
         return false;
     }
+    if (uma_parallel_load_order && (!uma_buffer_gate_enabled || uma_buffer_min_available == 0)) {
+        LLAMA_LOG_ERROR("%s: UMA loader parallel order requires --uma-loader-buffer-gate and --uma-loader-buffer-min-available-gib\n", __func__);
+        return false;
+    }
 
     if (uma_interleaved_load_order && !ml.no_alloc) {
         LLAMA_LOG_INFO("%s: UMA loader interleaved backend buffer allocation and tensor loading enabled\n", __func__);
@@ -1621,40 +1639,49 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: UMA loader parallel local/remote tensor loading enabled; backend buffers are allocated before parallel load\n", __func__);
     }
 
-    auto uma_backend_buffer_gate = [&](const char * buft_name, size_t buf_size, uint64_t psi_before) {
+    auto uma_backend_buffer_gate = [&](const char * buft_name, size_t buf_size, llama_model_psi_totals psi_before) {
         if (!uma_buffer_gate_enabled) {
             return;
         }
 
-        uint64_t psi_now = llama_model_memory_psi_total();
+        llama_model_psi_totals psi_now = llama_model_memory_psi_totals();
         uint64_t available_now = llama_model_mem_available_bytes();
-        bool psi_moved = psi_now > psi_before;
-        bool low_available = uma_buffer_min_available > 0 && available_now > 0 && available_now < uma_buffer_min_available;
+        bool psi_moved = psi_now.some > psi_before.some || psi_now.full > psi_before.full;
+        bool low_available = uma_buffer_min_available > 0 && (available_now == 0 || available_now < uma_buffer_min_available);
 
         if (!psi_moved && !low_available) {
             return;
         }
 
-        LLAMA_LOG_WARN("%s: UMA backend buffer gate after %s %.2f MiB: psi %llu -> %llu, MemAvailable %.2f GiB, waiting up to %u s\n",
+        LLAMA_LOG_WARN("%s: UMA backend buffer gate after %s %.2f MiB: psi some/full %" PRIu64 "/%" PRIu64 " -> %" PRIu64 "/%" PRIu64 ", MemAvailable %.2f GiB, waiting up to %u s\n",
                 __func__, buft_name, buf_size / 1024.0 / 1024.0,
-                (unsigned long long) psi_before, (unsigned long long) psi_now,
+                psi_before.some, psi_before.full, psi_now.some, psi_now.full,
                 available_now / 1024.0 / 1024.0 / 1024.0, uma_loader_buffer_gate);
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(uma_loader_buffer_gate);
+        bool gate_ok = false;
         while (std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-            const uint64_t psi_next = llama_model_memory_psi_total();
+            const llama_model_psi_totals psi_next = llama_model_memory_psi_totals();
             const uint64_t available_next = llama_model_mem_available_bytes();
-            const bool psi_stable = psi_next == psi_now;
-            const bool available_ok = uma_buffer_min_available == 0 || available_next == 0 || available_next >= uma_buffer_min_available;
+            const bool psi_stable = psi_next.some == psi_now.some && psi_next.full == psi_now.full;
+            const bool available_ok = uma_buffer_min_available == 0 || (available_next != 0 && available_next >= uma_buffer_min_available);
 
             psi_now = psi_next;
             available_now = available_next;
 
             if (psi_stable && available_ok) {
+                gate_ok = true;
                 break;
             }
+        }
+        if (!gate_ok && !llama_model_env_bool("LLAMA_UMA_LOADER_GATE_FAIL_OPEN", false)) {
+            throw std::runtime_error(format(
+                        "%s: UMA backend buffer gate timed out after %u s after %s %.2f MiB, psi some/full=%" PRIu64 "/%" PRIu64
+                        ", MemAvailable=%.2f GiB",
+                        __func__, uma_loader_buffer_gate, buft_name, buf_size / 1024.0 / 1024.0,
+                        psi_now.some, psi_now.full, available_now / 1024.0 / 1024.0 / 1024.0));
         }
     };
 
@@ -1764,7 +1791,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                const uint64_t psi_before = llama_model_memory_psi_total();
+                const llama_model_psi_totals psi_before = llama_model_memory_psi_totals();
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1781,7 +1808,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                const uint64_t psi_before = llama_model_memory_psi_total();
+                const llama_model_psi_totals psi_before = llama_model_memory_psi_totals();
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
                 if (buf != nullptr) {
                     uma_backend_buffer_gate(ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf), psi_before);

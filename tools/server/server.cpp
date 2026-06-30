@@ -14,6 +14,8 @@
 
 #include <atomic>
 #include <clocale>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -34,6 +36,11 @@ static inline void signal_handler(int signal) {
     }
 
     shutdown_handler(signal);
+}
+
+static bool server_odirect_stream_spawn_enabled() {
+    const char * value = std::getenv("GGML_ODIRECT_STREAM_SPAWN");
+    return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 // wrapper function that handles exceptions and logs errors
@@ -377,11 +384,16 @@ int llama_server(int argc, char ** argv) {
             llama_backend_free();
         };
 
-        // start the HTTP server before loading the model to be able to serve /health requests
-        if (!ctx_http.start()) {
-            clean_up();
-            SRV_ERR("%s", "exiting due to HTTP server error\n");
-            return 1;
+        const bool defer_http_start = server_odirect_stream_spawn_enabled();
+        if (!defer_http_start) {
+            // start the HTTP server before loading the model to be able to serve /health requests
+            if (!ctx_http.start()) {
+                clean_up();
+                SRV_ERR("%s", "exiting due to HTTP server error\n");
+                return 1;
+            }
+        } else {
+            SRV_WRN("%s", "deferring HTTP server start until after model load because O_DIRECT streamer child spawn is enabled\n");
         }
 
         // setup communication child --> router if necessary
@@ -398,6 +410,14 @@ int llama_server(int argc, char ** argv) {
             }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
+        }
+
+        if (defer_http_start) {
+            if (!ctx_http.start()) {
+                clean_up();
+                SRV_ERR("%s", "exiting due to HTTP server error\n");
+                return 1;
+            }
         }
 
         routes.update_meta(ctx_server);

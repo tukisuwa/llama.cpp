@@ -332,12 +332,12 @@ static bool llama_odirect_rate_limit_weighted(bool rpc, size_t bytes) {
     }
 
     const double path_weight = rpc ? std::max(0.0, rpc_weight) : std::max(0.0, local_weight);
+    llama_odirect_rate_limit_impl(bytes, total_mibps, global_mutex, global_next_time);
     if (path_weight <= 0.0) {
         return true;
     }
 
     const double path_mibps = total_mibps * path_weight / weight_sum;
-    llama_odirect_rate_limit_impl(bytes, total_mibps, global_mutex, global_next_time);
     llama_odirect_rate_limit_impl(bytes, path_mibps, rpc ? rpc_mutex : local_mutex, rpc ? rpc_next_time : local_next_time);
     return true;
 }
@@ -2122,7 +2122,7 @@ bool llama_model_loader::load_all_data(
         const bool psi_some_moved = psi_now.some > psi_before.some;
         const bool psi_full_moved = psi_now.full > psi_before.full;
         const bool psi_moved = psi_some_moved || psi_full_moved;
-        const bool low_available = min_available_bytes > 0 && available_now > 0 && available_now < min_available_bytes;
+        const bool low_available = min_available_bytes > 0 && (available_now == 0 || available_now < min_available_bytes);
 
         if (uma_loader_psi_gate > 0 && (psi_moved || low_available)) {
             LLAMA_LOG_WARN("%s: UMA loader slice gate: psi some %" PRIu64 " -> %" PRIu64 ", full %" PRIu64 " -> %" PRIu64 ", MemAvailable %.2f GiB, waiting up to %u s%s%s%s\n",
@@ -2133,20 +2133,30 @@ bool llama_model_loader::load_all_data(
                     low_available ? " [available]" : "");
 
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(uma_loader_psi_gate);
+            bool gate_ok = false;
             do {
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 const llama_psi_totals psi_next = llama_memory_psi_totals();
                 const uint64_t available_next = llama_mem_available_bytes();
                 const bool psi_stable = psi_next.some == psi_now.some && psi_next.full == psi_now.full;
-                const bool available_ok = min_available_bytes == 0 || available_next == 0 || available_next >= min_available_bytes;
+                const bool available_ok = min_available_bytes == 0 || (available_next != 0 && available_next >= min_available_bytes);
 
                 if (psi_stable && available_ok) {
+                    gate_ok = true;
                     break;
                 }
                 psi_now = psi_next;
                 last_mem_psi_total = psi_now;
                 available_now = available_next;
             } while (std::chrono::steady_clock::now() < deadline);
+            if (!gate_ok && !llama_env_equals("LLAMA_UMA_LOADER_GATE_FAIL_OPEN", "1")) {
+                cancelled.store(true);
+                throw std::runtime_error(format(
+                            "%s: UMA loader slice gate timed out after %u s with psi some/full=%" PRIu64 "/%" PRIu64
+                            " and MemAvailable=%.2f GiB",
+                            __func__, uma_loader_psi_gate, psi_now.some, psi_now.full,
+                            available_now / 1024.0 / 1024.0 / 1024.0));
+            }
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -2219,9 +2229,73 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                read_file_raw_locked(weight->idx, weight->offs, cur->data, n_size, false);
                 if (uma_loader_safe) {
-                    file->advise_dontneed(weight->offs, n_size);
+                    const bool use_host_odirect =
+                        local_odirect_process_direct || local_odirect_stream_direct || local_odirect_stream_async;
+                    if (!use_host_odirect) {
+                        cancelled.store(true);
+                        throw std::runtime_error(format(
+                                    "%s: UMA safe loader requires local O_DIRECT direct/local/async mode for host tensor %s",
+                                    __func__, ggml_get_name(cur)));
+                    }
+                    slice_counted_in_chunks = true;
+#if defined(__linux__)
+                    const size_t chunk_size = 64 * MiB;
+                    if (!logged_local_odirect_direct) {
+                        LLAMA_LOG_WARN("%s: UMA loader host O_DIRECT tensor-read path enabled, mode = %s, endpoint = %s, chunk = %.2f MiB\n",
+                                __func__, local_odirect_process_direct ? "local" :
+                                    (local_odirect_stream_async ? "async" : "direct"),
+                                local_odirect_stream_endpoint, chunk_size / 1024.0 / 1024.0);
+                        logged_local_odirect_direct = true;
+                    }
+                    read_buf.resize(std::min(n_size, chunk_size));
+                    std::unique_ptr<void, llama_aligned_free> aligned_read_buf;
+                    void * aligned_read_raw = nullptr;
+                    const size_t aligned_read_size = chunk_size + 4096;
+                    if (local_odirect_process_direct) {
+                        const int ret = posix_memalign(&aligned_read_raw, 4096, aligned_read_size);
+                        if (ret != 0) {
+                            throw std::runtime_error(format("%s: posix_memalign failed with error %d", __func__, ret));
+                        }
+                        aligned_read_buf.reset(aligned_read_raw);
+                    }
+
+                    size_t data_read = 0;
+                    while (data_read < n_size) {
+                        if (cancelled.load()) {
+                            return false;
+                        }
+                        const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
+                        void * data_ptr = read_buf.data();
+                        if (local_odirect_process_direct) {
+                            const int fd = get_local_odirect_fd(weight->idx, false);
+                            const int tail_fd = get_local_odirect_fd(weight->idx, true);
+                            llama_odirect_rate_limit_local(data_to_copy);
+                            if (!llama_read_local_odirect(fd, tail_fd, file->size(), weight->offs + data_read, data_to_copy,
+                                        aligned_read_buf.get(), aligned_read_size, &data_ptr)) {
+                                throw std::runtime_error(format("%s: failed to read host tensor from local O_DIRECT file %s",
+                                            __func__, file->path().c_str()));
+                            }
+                        } else {
+                            if (!llama_read_from_odirect_stream(local_odirect_stream_endpoint, file->path().c_str(),
+                                        weight->offs + data_read, read_buf.data(), data_to_copy)) {
+                                throw std::runtime_error(format("%s: failed to read host tensor from local O_DIRECT stream endpoint %s",
+                                            __func__, local_odirect_stream_endpoint));
+                            }
+                        }
+                        memcpy(static_cast<uint8_t *>(cur->data) + data_read, data_ptr, data_to_copy);
+                        data_read += data_to_copy;
+                        slice_done += data_to_copy;
+                        uma_slice_gate();
+                    }
+#else
+                    throw std::runtime_error(format("%s: host O_DIRECT tensor-read path is unavailable on this platform", __func__));
+#endif
+                } else {
+                    read_file_raw_locked(weight->idx, weight->offs, cur->data, n_size, false);
+                    if (uma_loader_safe) {
+                        file->advise_dontneed(weight->offs, n_size);
+                    }
                 }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {

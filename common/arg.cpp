@@ -2423,7 +2423,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UMA_LOADER_INTERLEAVE_BUFFER_LOAD"));
     add_opt(common_arg(
         {"--uma-loader-buffer-load-order"}, "ORDER",
-        "UMA safe loader: backend buffer allocation/load order: default, round-robin, remote-first, parallel",
+        "UMA safe loader: backend buffer allocation/load order: default, round-robin, remote-first, parallel; parallel requires buffer gate + min MemAvailable",
         [](common_params & params, const std::string & value) {
             if (value == "default") {
                 params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
@@ -2460,7 +2460,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UMA_LOADER_SLICE_MIB"));
     add_opt(common_arg(
         {"--uma-loader-psi-gate"}, "N",
-        "UMA safe loader: at slice boundaries, wait up to N seconds if memory PSI total increased (0 = disabled)",
+        "UMA safe loader: at slice boundaries, wait up to N seconds if memory PSI total increased, then abort unless LLAMA_UMA_LOADER_GATE_FAIL_OPEN=1 (0 = disabled)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2490,7 +2490,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_UMA_LOADER_BUFFER_SLICE_LAYERS"));
     add_opt(common_arg(
         {"--uma-loader-buffer-gate"}, "N",
-        "UMA safe loader: after backend buffer allocation, wait up to N seconds if memory PSI moved or MemAvailable is below threshold (0 = disabled)",
+        "UMA safe loader: after backend buffer allocation, wait up to N seconds if memory PSI moved or MemAvailable is below threshold, then abort unless LLAMA_UMA_LOADER_GATE_FAIL_OPEN=1 (0 = disabled)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
