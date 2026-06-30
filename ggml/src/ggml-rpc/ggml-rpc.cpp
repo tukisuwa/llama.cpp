@@ -112,6 +112,10 @@ static bool rpc_server_supports_set_tensor_from_file(const rpc_server_version & 
     return version.major == RPC_PROTO_MAJOR_VERSION && (version.minor > 0 || version.patch >= 2);
 }
 
+static bool rpc_server_supports_set_tensor_stream(const rpc_server_version & version) {
+    return version.major == RPC_PROTO_MAJOR_VERSION && (version.minor > 0 || version.patch >= 3);
+}
+
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
 };
@@ -256,6 +260,7 @@ struct ggml_backend_rpc_buffer_context {
     void * base_ptr;
     uint64_t remote_ptr;
     bool supports_set_tensor_from_file;
+    bool supports_set_tensor_stream;
 };
 
 // RPC helper functions
@@ -435,6 +440,12 @@ static bool rpc_endpoint_supports_set_tensor_from_file(const std::string & endpo
     return it != rpc_endpoint_versions().end() && rpc_server_supports_set_tensor_from_file(it->second);
 }
 
+static bool rpc_endpoint_supports_set_tensor_stream(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
+    auto it = rpc_endpoint_versions().find(endpoint);
+    return it != rpc_endpoint_versions().end() && rpc_server_supports_set_tensor_stream(it->second);
+}
+
 static bool rpc_validate_tensor_range(
         const char * func,
         uint64_t data,
@@ -479,9 +490,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::s
         std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
         rpc_endpoint_versions()[endpoint] = rpc_server_version { response.major, response.minor, response.patch };
     }
-    GGML_LOG_INFO("RPC endpoint %s protocol %d.%d.%d, set_tensor_from_file=%s\n",
+    GGML_LOG_INFO("RPC endpoint %s protocol %d.%d.%d, set_tensor_from_file=%s, set_tensor_stream=%s\n",
                   endpoint.c_str(), response.major, response.minor, response.patch,
-                  rpc_server_supports_set_tensor_from_file({ response.major, response.minor, response.patch }) ? "yes" : "no");
+                  rpc_server_supports_set_tensor_from_file({ response.major, response.minor, response.patch }) ? "yes" : "no",
+                  rpc_server_supports_set_tensor_stream({ response.major, response.minor, response.patch }) ? "yes" : "no");
     return true;
 }
 
@@ -683,6 +695,11 @@ bool ggml_backend_rpc_buffer_set_tensor_from_callback(
     if (ctx->sock == nullptr) {
         return false;
     }
+    if (!ctx->supports_set_tensor_stream) {
+        GGML_LOG_ERROR("[%s] RPC server does not support SET_TENSOR_STREAM; refusing callback stream upload before sending payload\n",
+                __func__);
+        return false;
+    }
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     const uint64_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
     const uint64_t offset = (uint64_t) tensor_offset;
@@ -790,12 +807,14 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
         const bool supports_set_tensor_from_file = rpc_endpoint_supports_set_tensor_from_file(buft_ctx->endpoint);
-        GGML_LOG_INFO("RPC buffer %s size %.2f MiB, set_tensor_from_file=%s\n",
+        const bool supports_set_tensor_stream = rpc_endpoint_supports_set_tensor_stream(buft_ctx->endpoint);
+        GGML_LOG_INFO("RPC buffer %s size %.2f MiB, set_tensor_from_file=%s, set_tensor_stream=%s\n",
                       buft_ctx->endpoint.c_str(), response.remote_size / 1024.0 / 1024.0,
-                      supports_set_tensor_from_file ? "yes" : "no");
+                      supports_set_tensor_from_file ? "yes" : "no",
+                      supports_set_tensor_stream ? "yes" : "no");
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, supports_set_tensor_from_file},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, supports_set_tensor_from_file, supports_set_tensor_stream},
             response.remote_size);
         return buffer;
     } else {
