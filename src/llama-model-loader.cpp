@@ -215,11 +215,12 @@ static bool llama_read_local_odirect(
         size_t aligned_buffer_size,
         void ** data) {
     constexpr size_t alignment = 4096;
-    if (fd < 0 || aligned_buffer == nullptr || data == nullptr || file_offset > file_size) {
+    if (fd < 0 || aligned_buffer == nullptr || data == nullptr ||
+            file_offset > file_size || size > file_size - file_offset) {
         return false;
     }
 
-    const uint64_t requested = std::min<uint64_t>(size, file_size - file_offset);
+    const uint64_t requested = size;
     const uint64_t aligned_offset = file_offset & ~(static_cast<uint64_t>(alignment) - 1);
     const size_t skip = static_cast<size_t>(file_offset - aligned_offset);
     if (skip + requested > aligned_buffer_size) {
@@ -1096,6 +1097,11 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
+    file_read_mutexes.clear();
+    file_read_mutexes.reserve(files.size());
+    for (size_t i = 0; i < files.size(); ++i) {
+        file_read_mutexes.emplace_back(new std::mutex());
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -1978,6 +1984,20 @@ bool llama_model_loader::load_all_data(
         local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
         local_odirect_stream_mode != nullptr && strcmp(local_odirect_stream_mode, "local") == 0;
 
+    auto read_file_raw_locked = [&](int file_idx, size_t offset, void * data, size_t size, bool unsafe) {
+        if (file_idx < 0 || (size_t) file_idx >= files.size() || (size_t) file_idx >= file_read_mutexes.size()) {
+            throw std::runtime_error(format("%s: invalid file index %d for shared read", __func__, file_idx));
+        }
+        std::lock_guard<std::mutex> lock(*file_read_mutexes[file_idx]);
+        auto & file = files.at(file_idx);
+        file->seek(offset, SEEK_SET);
+        if (unsafe) {
+            file->read_raw_unsafe(data, size);
+        } else {
+            file->read_raw(data, size);
+        }
+    };
+
     const size_t slice_bytes = (uma_loader_safe && uma_loader_slice_mib > 0) ? (size_t) uma_loader_slice_mib * MiB : 0;
     const uint64_t min_available_bytes =
         (uma_loader_safe && uma_loader_min_available_gib > 0) ? (uint64_t) uma_loader_min_available_gib * GiB : 0;
@@ -2114,8 +2134,7 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                read_file_raw_locked(weight->idx, weight->offs, cur->data, n_size, false);
                 if (uma_loader_safe) {
                     file->advise_dontneed(weight->offs, n_size);
                 }
@@ -2229,7 +2248,6 @@ bool llama_model_loader::load_all_data(
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
                     size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
 
                     // Calculate aligned read boundaries
                     size_t read_start = aligned_offset;
@@ -2267,7 +2285,8 @@ bool llama_model_loader::load_all_data(
                             throw std::runtime_error(format("%s: local O_DIRECT stream path is unavailable on this platform", __func__));
 #endif
                         } else {
-                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                            read_file_raw_locked(weight->idx, read_start + bytes_read,
+                                    reinterpret_cast<void *>(ptr_dest_aligned), read_size, true);
                         }
                         if (uma_loader_safe && !use_local_odirect_stream) {
                             file->advise_dontneed(read_start + bytes_read, read_size);
@@ -2380,8 +2399,7 @@ bool llama_model_loader::load_all_data(
                         uma_slice_gate();
                     } else if (check_tensors) {
                         read_buf.resize(n_size);
-                        file->seek(weight->offs, SEEK_SET);
-                        file->read_raw(read_buf.data(), n_size);
+                        read_file_raw_locked(weight->idx, weight->offs, read_buf.data(), n_size, false);
                         if (uma_loader_safe) {
                             file->advise_dontneed(weight->offs, n_size);
                         }
@@ -2403,8 +2421,8 @@ bool llama_model_loader::load_all_data(
 
                         while (data_read < n_size) {
                             const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
-                            file->seek(weight->offs + data_read, SEEK_SET);
-                            file->read_raw(read_buf.data(), data_to_copy);
+                            read_file_raw_locked(weight->idx, weight->offs + data_read,
+                                    read_buf.data(), data_to_copy, false);
                             if (uma_loader_safe) {
                                 file->advise_dontneed(weight->offs + data_read, data_to_copy);
                             }

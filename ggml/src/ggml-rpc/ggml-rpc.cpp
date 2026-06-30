@@ -301,6 +301,11 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
     return sock->recv_data(input.data(), size);
 }
 
+static bool recv_empty_msg(socket_ptr sock) {
+    uint64_t size;
+    return sock->recv_data(&size, sizeof(size)) && size == 0;
+}
+
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
     size_t pos = endpoint.find(':');
     if (pos == std::string::npos) {
@@ -571,7 +576,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(
         { stream_endpoint, request.stream_endpoint_len },
         { path,            request.path_len },
     };
-    bool status = send_rpc_cmd_parts(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE, parts, 3);
+    bool status = send_rpc_cmd_parts(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE, parts, 3) && recv_empty_msg(ctx->sock);
     RPC_STATUS_ASSERT(status);
     return status;
 }
@@ -1973,6 +1978,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor_from_file(input)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
                 break;
