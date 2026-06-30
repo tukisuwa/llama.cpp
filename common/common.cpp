@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1544,18 +1545,44 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
-    mparams.uma_loader_interleave_buffer_load = params.uma_loader_interleave_buffer_load;
-    mparams.uma_loader_safe = params.uma_loader_safe;
-    mparams.uma_loader_slice_mib = params.uma_loader_slice_mib < 0 ? 0 : params.uma_loader_slice_mib;
-    mparams.uma_loader_psi_gate  = params.uma_loader_psi_gate  < 0 ? 0 : params.uma_loader_psi_gate;
-    mparams.uma_loader_min_available_gib = params.uma_loader_min_available_gib < 0 ? 0 : params.uma_loader_min_available_gib;
-    mparams.uma_loader_buffer_slice_layers = params.uma_loader_buffer_slice_layers < 0 ? 0 : params.uma_loader_buffer_slice_layers;
-    mparams.uma_loader_buffer_gate = params.uma_loader_buffer_gate < 0 ? 0 : params.uma_loader_buffer_gate;
-    mparams.uma_loader_buffer_min_available_gib = params.uma_loader_buffer_min_available_gib < 0 ? 0 : params.uma_loader_buffer_min_available_gib;
-    mparams.uma_loader_upload_chunk_mib = params.uma_loader_upload_chunk_mib < 0 ? 0 : params.uma_loader_upload_chunk_mib;
-    mparams.uma_loader_buffer_load_order = params.uma_loader_buffer_load_order;
 
-    if (mparams.uma_loader_safe) {
+    auto set_loader_env = [](const char * name, const std::string & value) {
+#if defined(_WIN32)
+        _putenv_s(name, value.c_str());
+#else
+        setenv(name, value.c_str(), 1);
+#endif
+    };
+    auto set_loader_env_int = [&](const char * name, int32_t value) {
+        set_loader_env(name, std::to_string(value < 0 ? 0 : value));
+    };
+
+    set_loader_env("LLAMA_UMA_LOADER_SAFE", params.uma_loader_safe ? "1" : "0");
+    set_loader_env_int("LLAMA_UMA_LOADER_SLICE_MIB", params.uma_loader_slice_mib);
+    set_loader_env_int("LLAMA_UMA_LOADER_PSI_GATE", params.uma_loader_psi_gate);
+    set_loader_env_int("LLAMA_UMA_LOADER_MIN_AVAILABLE_GIB", params.uma_loader_min_available_gib);
+    set_loader_env_int("LLAMA_UMA_LOADER_BUFFER_SLICE_LAYERS", params.uma_loader_buffer_slice_layers);
+    set_loader_env_int("LLAMA_UMA_LOADER_BUFFER_GATE", params.uma_loader_buffer_gate);
+    set_loader_env_int("LLAMA_UMA_LOADER_BUFFER_MIN_AVAILABLE_GIB", params.uma_loader_buffer_min_available_gib);
+    set_loader_env_int("LLAMA_UMA_LOADER_UPLOAD_CHUNK_MIB", params.uma_loader_upload_chunk_mib);
+    set_loader_env("LLAMA_UMA_LOADER_INTERLEAVE_BUFFER_LOAD", params.uma_loader_interleave_buffer_load ? "1" : "0");
+    switch (params.uma_loader_buffer_load_order) {
+        case LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN:
+            set_loader_env("LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER", "round-robin");
+            break;
+        case LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST:
+            set_loader_env("LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER", "remote-first");
+            break;
+        case LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL:
+            set_loader_env("LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER", "parallel");
+            break;
+        case LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT:
+        default:
+            set_loader_env("LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER", "default");
+            break;
+    }
+
+    if (params.uma_loader_safe) {
         mparams.use_mmap = false;
     }
 

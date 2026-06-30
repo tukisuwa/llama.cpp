@@ -111,6 +111,7 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::mutex size_done_mutex;
     std::mutex progress_callback_mutex;
+    bool progress_final_emitted = false;
     std::vector<std::unique_ptr<std::mutex>> file_read_mutexes;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 

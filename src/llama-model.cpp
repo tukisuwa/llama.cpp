@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <fstream>
@@ -39,6 +40,45 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+static bool llama_model_env_bool(const char * name, bool fallback = false) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0;
+}
+
+static uint32_t llama_model_env_u32(const char * name, uint32_t fallback = 0) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char * end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return fallback;
+    }
+    return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t) parsed;
+}
+
+static llama_uma_buffer_load_order llama_model_env_load_order() {
+    const char * value = std::getenv("LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "default") == 0) {
+        return LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
+    }
+    if (std::strcmp(value, "round-robin") == 0) {
+        return LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN;
+    }
+    if (std::strcmp(value, "remote-first") == 0) {
+        return LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST;
+    }
+    if (std::strcmp(value, "parallel") == 0) {
+        return LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
+    }
+    LLAMA_LOG_ERROR("%s: invalid LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER=%s\n", __func__, value);
+    return LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
+}
 
 static uint64_t llama_model_memory_psi_total() {
     std::ifstream psi("/proc/pressure/memory");
@@ -1543,22 +1583,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
     const uint64_t GiB = 1024ull*1024ull*1024ull;
-    const bool uma_buffer_gate_enabled = params.uma_loader_safe && params.uma_loader_buffer_gate > 0;
+    const bool uma_loader_safe = ml.uma_loader_safe;
+    const bool uma_loader_interleave_buffer_load = llama_model_env_bool("LLAMA_UMA_LOADER_INTERLEAVE_BUFFER_LOAD", false);
+    const uint32_t uma_loader_buffer_gate = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_GATE");
+    const uint32_t uma_loader_buffer_min_available_gib = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_MIN_AVAILABLE_GIB");
+    const llama_uma_buffer_load_order uma_loader_buffer_load_order = llama_model_env_load_order();
+    const bool uma_buffer_gate_enabled = uma_loader_safe && uma_loader_buffer_gate > 0;
     const uint64_t uma_buffer_min_available =
-        params.uma_loader_buffer_min_available_gib > 0 ? (uint64_t) params.uma_loader_buffer_min_available_gib * GiB : 0;
+        uma_loader_buffer_min_available_gib > 0 ? (uint64_t) uma_loader_buffer_min_available_gib * GiB : 0;
 
     if (uma_buffer_gate_enabled) {
         LLAMA_LOG_INFO("%s: UMA loader backend buffer gate enabled, max wait = %u s, min MemAvailable = %u GiB\n",
-                __func__, params.uma_loader_buffer_gate, params.uma_loader_buffer_min_available_gib);
+                __func__, uma_loader_buffer_gate, uma_loader_buffer_min_available_gib);
     }
     const bool uma_interleaved_load_order =
-        params.uma_loader_buffer_load_order != LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ||
-        params.uma_loader_interleave_buffer_load;
+        uma_loader_buffer_load_order != LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ||
+        uma_loader_interleave_buffer_load;
 
     const bool uma_parallel_load_order =
-        params.uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
+        uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
 
-    if (uma_interleaved_load_order && (!params.uma_loader_safe || ml.use_mmap)) {
+    if (uma_interleaved_load_order && (!uma_loader_safe || ml.use_mmap)) {
         LLAMA_LOG_ERROR("%s: UMA backend buffer load ordering requires --uma-loader-safe and --no-mmap\n", __func__);
         return false;
     }
@@ -1587,9 +1632,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: UMA backend buffer gate after %s %.2f MiB: psi %llu -> %llu, MemAvailable %.2f GiB, waiting up to %u s\n",
                 __func__, buft_name, buf_size / 1024.0 / 1024.0,
                 (unsigned long long) psi_before, (unsigned long long) psi_now,
-                available_now / 1024.0 / 1024.0 / 1024.0, params.uma_loader_buffer_gate);
+                available_now / 1024.0 / 1024.0 / 1024.0, uma_loader_buffer_gate);
 
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(params.uma_loader_buffer_gate);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(uma_loader_buffer_gate);
         while (std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
@@ -1627,8 +1672,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             group->items.push_back(it);
         }
 
-        const auto load_order = params.uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ?
-            LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN : params.uma_loader_buffer_load_order;
+        const auto load_order = uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ?
+            LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN : uma_loader_buffer_load_order;
 
         if (load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST || load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL) {
             auto is_remote_group = [](const ctx_buft_group & group) {
@@ -2529,17 +2574,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
-        /*.uma_loader_interleave_buffer_load =*/ false,
-        /*.uma_loader_safe             =*/ false,
         /*.no_alloc                    =*/ false,
-        /*.uma_loader_slice_mib        =*/ 0,
-        /*.uma_loader_psi_gate         =*/ 0,
-        /*.uma_loader_min_available_gib =*/ 0,
-        /*.uma_loader_buffer_slice_layers =*/ 0,
-        /*.uma_loader_buffer_gate      =*/ 0,
-        /*.uma_loader_buffer_min_available_gib =*/ 0,
-        /*.uma_loader_upload_chunk_mib =*/ 0,
-        /*.uma_loader_buffer_load_order =*/ LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT,
     };
 
     return result;

@@ -2009,14 +2009,31 @@ bool llama_model_loader::load_all_data(
     const char * rpc_odirect_stream_mode = uma_loader_safe ? std::getenv("GGML_RPC_ODIRECT_STREAM_MODE") : nullptr;
     const char * local_odirect_stream_endpoint = uma_loader_safe ? std::getenv("GGML_LOCAL_ODIRECT_STREAM_ENDPOINT") : nullptr;
     const char * local_odirect_stream_mode = uma_loader_safe ? std::getenv("GGML_LOCAL_ODIRECT_STREAM_MODE") : nullptr;
+    auto mode_is = [](const char * mode, const char * value) {
+        return mode != nullptr && strcmp(mode, value) == 0;
+    };
+    if (uma_loader_safe && rpc_odirect_stream_mode != nullptr && rpc_odirect_stream_mode[0] != '\0' &&
+            !mode_is(rpc_odirect_stream_mode, "stream") && !mode_is(rpc_odirect_stream_mode, "local")) {
+        throw std::runtime_error(format("%s: invalid GGML_RPC_ODIRECT_STREAM_MODE=%s", __func__, rpc_odirect_stream_mode));
+    }
+    if (uma_loader_safe && local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
+            local_odirect_stream_mode != nullptr && local_odirect_stream_mode[0] != '\0' &&
+            !mode_is(local_odirect_stream_mode, "direct") && !mode_is(local_odirect_stream_mode, "local") &&
+            !mode_is(local_odirect_stream_mode, "async")) {
+        throw std::runtime_error(format("%s: invalid GGML_LOCAL_ODIRECT_STREAM_MODE=%s", __func__, local_odirect_stream_mode));
+    }
+    if (uma_loader_safe && mode_is(rpc_odirect_stream_mode, "stream") &&
+            (rpc_odirect_stream_endpoint == nullptr || rpc_odirect_stream_endpoint[0] == '\0')) {
+        throw std::runtime_error(format("%s: GGML_RPC_ODIRECT_STREAM_MODE=stream requires GGML_RPC_ODIRECT_STREAM_ENDPOINT", __func__));
+    }
     const bool rpc_odirect_process_direct =
-        rpc_odirect_stream_mode != nullptr && strcmp(rpc_odirect_stream_mode, "local") == 0;
+        mode_is(rpc_odirect_stream_mode, "local");
     const bool local_odirect_stream_direct =
         local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
-        (local_odirect_stream_mode == nullptr || local_odirect_stream_mode[0] == '\0' || strcmp(local_odirect_stream_mode, "direct") == 0);
+        (local_odirect_stream_mode == nullptr || local_odirect_stream_mode[0] == '\0' || mode_is(local_odirect_stream_mode, "direct"));
     const bool local_odirect_process_direct =
         local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
-        local_odirect_stream_mode != nullptr && strcmp(local_odirect_stream_mode, "local") == 0;
+        mode_is(local_odirect_stream_mode, "local");
 
     auto read_file_raw_locked = [&](int file_idx, size_t offset, void * data, size_t size, bool unsafe) {
         if (file_idx < 0 || (size_t) file_idx >= files.size() || (size_t) file_idx >= file_read_mutexes.size()) {
@@ -2581,6 +2598,11 @@ bool llama_model_loader::load_all_data(
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
+            std::lock_guard<std::mutex> lock(progress_callback_mutex);
+            if (progress_final_emitted) {
+                return true;
+            }
+            progress_final_emitted = true;
             return progress_callback(1.0f, progress_callback_user_data);
         }
     }

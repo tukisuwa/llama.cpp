@@ -32,9 +32,12 @@
 #include <chrono>
 
 #if defined(__linux__)
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -64,6 +67,32 @@ static std::string endpoint_port(const std::string & endpoint) {
         return "";
     }
     return endpoint.substr(pos + 1);
+}
+
+static std::string endpoint_host(const std::string & endpoint) {
+    const size_t pos = endpoint.rfind(':');
+    if (pos == std::string::npos) {
+        return "";
+    }
+    return endpoint.substr(0, pos);
+}
+
+static bool can_connect_tcp(const std::string & host, int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t) port);
+    std::string connect_host = host.empty() || host == "0.0.0.0" ? "127.0.0.1" : host;
+    if (inet_pton(AF_INET, connect_host.c_str(), &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+    const bool ok = connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+    close(fd);
+    return ok;
 }
 
 static void set_child_env_if_nonempty(const char * name, const std::string & value) {
@@ -147,15 +176,24 @@ public:
 
         child_label = label;
         SRV_INF("started O_DIRECT streamer %s: pid %d endpoint %s\n", child_label.c_str(), (int) pid, endpoint.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        int status = 0;
-        const pid_t exited = waitpid(pid, &status, WNOHANG);
-        if (exited == pid || kill(pid, 0) != 0) {
-            SRV_ERR("O_DIRECT streamer %s exited during startup\n", child_label.c_str());
-            pid = -1;
-            return false;
+        const std::string connect_host = endpoint_host(endpoint);
+        const int connect_port = std::stoi(port);
+        for (int i = 0; i < 50; ++i) {
+            int status = 0;
+            const pid_t exited = waitpid(pid, &status, WNOHANG);
+            if (exited == pid || kill(pid, 0) != 0) {
+                SRV_ERR("O_DIRECT streamer %s exited during startup\n", child_label.c_str());
+                pid = -1;
+                return false;
+            }
+            if (can_connect_tcp(connect_host, connect_port)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        return true;
+        SRV_ERR("O_DIRECT streamer %s did not accept connections at %s during startup\n", child_label.c_str(), endpoint.c_str());
+        stop();
+        return false;
     }
 
     void stop() {
