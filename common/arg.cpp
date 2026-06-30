@@ -2415,6 +2415,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--uma-loader-interleave-buffer-load"},
         "UMA safe loader: allocate and load each backend buffer slice before allocating the next one",
         [](common_params & params) {
+            params.uma_loader_safe = true;
+            params.use_mmap = false;
             params.uma_loader_interleave_buffer_load = true;
             params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN;
         }
@@ -2427,12 +2429,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
                 params.uma_loader_interleave_buffer_load = false;
             } else if (value == "round-robin") {
+                params.uma_loader_safe = true;
+                params.use_mmap = false;
                 params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN;
                 params.uma_loader_interleave_buffer_load = true;
             } else if (value == "remote-first") {
+                params.uma_loader_safe = true;
+                params.use_mmap = false;
                 params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST;
                 params.uma_loader_interleave_buffer_load = true;
             } else if (value == "parallel") {
+                params.uma_loader_safe = true;
+                params.use_mmap = false;
                 params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
                 params.uma_loader_interleave_buffer_load = true;
             } else {

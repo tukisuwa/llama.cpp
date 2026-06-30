@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -249,6 +250,7 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    bool supports_set_tensor_from_file;
 };
 
 // RPC helper functions
@@ -394,23 +396,20 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
-static std::mutex & rpc_server_versions_mutex() {
+static std::mutex & rpc_endpoint_versions_mutex() {
     static std::mutex mutex;
     return mutex;
 }
 
-static std::unordered_map<const socket_t *, rpc_server_version> & rpc_server_versions() {
-    static std::unordered_map<const socket_t *, rpc_server_version> versions;
+static std::unordered_map<std::string, rpc_server_version> & rpc_endpoint_versions() {
+    static std::unordered_map<std::string, rpc_server_version> versions;
     return versions;
 }
 
-static bool rpc_supports_set_tensor_from_file(const std::shared_ptr<socket_t> & sock) {
-    if (sock == nullptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(rpc_server_versions_mutex());
-    auto it = rpc_server_versions().find(sock.get());
-    return it != rpc_server_versions().end() &&
+static bool rpc_endpoint_supports_set_tensor_from_file(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
+    auto it = rpc_endpoint_versions().find(endpoint);
+    return it != rpc_endpoint_versions().end() &&
         it->second.major == RPC_PROTO_MAJOR_VERSION &&
         (it->second.minor > 0 || it->second.patch >= 2);
 }
@@ -418,7 +417,7 @@ static bool rpc_supports_set_tensor_from_file(const std::shared_ptr<socket_t> & 
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::string & endpoint) {
     rpc_msg_hello_req request = {};
     rpc_msg_hello_rsp response = {};
 
@@ -435,8 +434,8 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 
     sock->update_caps(response.conn_caps);
     {
-        std::lock_guard<std::mutex> lock(rpc_server_versions_mutex());
-        rpc_server_versions()[sock.get()] = rpc_server_version { response.major, response.minor, response.patch };
+        std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
+        rpc_endpoint_versions()[endpoint] = rpc_server_version { response.major, response.minor, response.patch };
     }
     return true;
 }
@@ -466,7 +465,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!negotiate_hello(sock)) {
+    if (!negotiate_hello(sock, endpoint)) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
@@ -597,7 +596,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(
     }
 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    if (!rpc_supports_set_tensor_from_file(ctx->sock)) {
+    if (!ctx->supports_set_tensor_from_file) {
         return false;
     }
 
@@ -729,7 +728,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, rpc_endpoint_supports_set_tensor_from_file(buft_ctx->endpoint)},
             response.remote_size);
         return buffer;
     } else {
@@ -1365,6 +1364,27 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input) {
     const char * path_ptr = stream_ptr + request->stream_endpoint_len;
     std::string stream_endpoint(stream_ptr, request->stream_endpoint_len);
     std::string path(path_ptr, request->path_len);
+
+    const char * enabled = std::getenv("GGML_RPC_ODIRECT_STREAM_ENABLE");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+        GGML_LOG_ERROR("[%s] RPC O_DIRECT stream command rejected: GGML_RPC_ODIRECT_STREAM_ENABLE is not 1\n", __func__);
+        return false;
+    }
+
+    const char * allowed_endpoint = std::getenv("GGML_RPC_ODIRECT_STREAM_ALLOW_ENDPOINT");
+    if (allowed_endpoint != nullptr && allowed_endpoint[0] != '\0' && stream_endpoint != allowed_endpoint) {
+        GGML_LOG_ERROR("[%s] RPC O_DIRECT stream endpoint rejected: %s\n", __func__, stream_endpoint.c_str());
+        return false;
+    }
+
+    const char * allowed_path_prefix = std::getenv("GGML_RPC_ODIRECT_STREAM_PATH_PREFIX");
+    if (allowed_path_prefix != nullptr && allowed_path_prefix[0] != '\0') {
+        const std::string prefix(allowed_path_prefix);
+        if (path.compare(0, prefix.size(), prefix) != 0) {
+            GGML_LOG_ERROR("[%s] RPC O_DIRECT stream path rejected: %s\n", __func__, path.c_str());
+            return false;
+        }
+    }
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),

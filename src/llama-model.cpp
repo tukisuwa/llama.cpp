@@ -1558,6 +1558,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool uma_parallel_load_order =
         params.uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
 
+    if (uma_interleaved_load_order && (!params.uma_loader_safe || ml.use_mmap)) {
+        LLAMA_LOG_ERROR("%s: UMA backend buffer load ordering requires --uma-loader-safe and --no-mmap\n", __func__);
+        return false;
+    }
+
     if (uma_interleaved_load_order && !ml.no_alloc) {
         LLAMA_LOG_INFO("%s: UMA loader interleaved backend buffer allocation and tensor loading enabled\n", __func__);
     }
