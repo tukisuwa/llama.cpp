@@ -1475,13 +1475,13 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input) {
         return false;
     }
 
-    const uint32_t path_len_net = htonl((uint32_t) path.size());
+    const uint32_t path_len_net = htonl((uint32_t) requested.size());
     const uint64_t file_offset_net = rpc_htonll(request->file_offset);
     const uint64_t size_net = rpc_htonll(request->size);
     if (!stream_sock->send_data(&path_len_net, sizeof(path_len_net)) ||
         !stream_sock->send_data(&file_offset_net, sizeof(file_offset_net)) ||
         !stream_sock->send_data(&size_net, sizeof(size_net)) ||
-        !stream_sock->send_data(path.data(), path.size())) {
+        !stream_sock->send_data(requested.data(), requested.size())) {
         GGML_LOG_ERROR("[%s] failed to send stream request\n", __func__);
         return false;
     }

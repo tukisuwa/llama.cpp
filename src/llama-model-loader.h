@@ -9,6 +9,7 @@
 
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
@@ -111,6 +112,7 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::mutex size_done_mutex;
     std::mutex progress_callback_mutex;
+    std::atomic_bool cancelled { false };
     bool progress_final_emitted = false;
     std::vector<std::unique_ptr<std::mutex>> file_read_mutexes;
     std::vector<std::pair<size_t, size_t>> mmaps_used;

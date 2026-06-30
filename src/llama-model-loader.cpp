@@ -1857,6 +1857,9 @@ bool llama_model_loader::load_all_data(
         }
         return true;
     }
+    if (cancelled.load()) {
+        return false;
+    }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
     std::vector<no_init<uint8_t>> read_buf;
@@ -2034,6 +2037,9 @@ bool llama_model_loader::load_all_data(
     const bool local_odirect_process_direct =
         local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
         mode_is(local_odirect_stream_mode, "local");
+    const bool local_odirect_stream_async =
+        local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
+        mode_is(local_odirect_stream_mode, "async");
 
     auto read_file_raw_locked = [&](int file_idx, size_t offset, void * data, size_t size, bool unsafe) {
         if (file_idx < 0 || (size_t) file_idx >= files.size() || (size_t) file_idx >= file_read_mutexes.size()) {
@@ -2149,6 +2155,9 @@ bool llama_model_loader::load_all_data(
     };
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (cancelled.load()) {
+            return false;
+        }
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
@@ -2170,6 +2179,7 @@ bool llama_model_loader::load_all_data(
             }
             std::lock_guard<std::mutex> lock(progress_callback_mutex);
             if (!progress_callback((float) current_size_done / size_data, progress_callback_user_data)) {
+                cancelled.store(true);
                 return false;
             }
         }
@@ -2246,6 +2256,9 @@ bool llama_model_loader::load_all_data(
                     size_t data_read = 0;
 
                     while (data_read < n_size) {
+                        if (cancelled.load()) {
+                            return false;
+                        }
                         const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
                         const llama_psi_totals psi_before_read = llama_memory_psi_totals();
                         const uint64_t available_before_read = llama_mem_available_bytes();
@@ -2332,6 +2345,9 @@ bool llama_model_loader::load_all_data(
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
 
                     while (bytes_read < read_end - read_start) {
+                        if (cancelled.load()) {
+                            return false;
+                        }
                         size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
 
                         // Align the destination pointer within the pinned buffer
@@ -2487,6 +2503,10 @@ bool llama_model_loader::load_all_data(
                         slice_done += n_size;
                         uma_slice_gate();
                     } else if (check_tensors) {
+                        if (local_odirect_stream_async && !cur_is_rpc_buffer) {
+                            cancelled.store(true);
+                            throw std::runtime_error(format("%s: GGML_LOCAL_ODIRECT_STREAM_MODE=async cannot be used with tensor checking fallback", __func__));
+                        }
                         read_buf.resize(n_size);
                         read_file_raw_locked(weight->idx, weight->offs, read_buf.data(), n_size, false);
                         if (uma_loader_safe) {
@@ -2497,6 +2517,10 @@ bool llama_model_loader::load_all_data(
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                         }
                     } else {
+                        if (local_odirect_stream_async && !cur_is_rpc_buffer) {
+                            cancelled.store(true);
+                            throw std::runtime_error(format("%s: GGML_LOCAL_ODIRECT_STREAM_MODE=async would fall back to buffered chunked reads", __func__));
+                        }
                         slice_counted_in_chunks = true;
                         const size_t chunk_size = std::max<size_t>(buffer_size, 64 * MiB);
                         if (!logged_chunked_tensor_set) {
@@ -2509,6 +2533,9 @@ bool llama_model_loader::load_all_data(
                         size_t data_read = 0;
 
                         while (data_read < n_size) {
+                            if (cancelled.load()) {
+                                return false;
+                            }
                             const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
                             read_file_raw_locked(weight->idx, weight->offs + data_read,
                                     read_buf.data(), data_to_copy, false);
@@ -2603,7 +2630,11 @@ bool llama_model_loader::load_all_data(
                 return true;
             }
             progress_final_emitted = true;
-            return progress_callback(1.0f, progress_callback_user_data);
+            if (!progress_callback(1.0f, progress_callback_user_data)) {
+                cancelled.store(true);
+                return false;
+            }
+            return true;
         }
     }
 

@@ -23,12 +23,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cfloat>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -49,17 +51,21 @@ static bool llama_model_env_bool(const char * name, bool fallback = false) {
     return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0;
 }
 
-static uint32_t llama_model_env_u32(const char * name, uint32_t fallback = 0) {
+static uint32_t llama_model_env_u32(const char * name, uint32_t fallback, uint32_t max_value) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
         return fallback;
     }
+    if (value[0] == '-' || value[0] == '+') {
+        throw std::runtime_error(format("%s: invalid unsigned value '%s'", name, value));
+    }
+    errno = 0;
     char * end = nullptr;
     const unsigned long parsed = std::strtoul(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return fallback;
+    if (errno == ERANGE || end == value || *end != '\0' || parsed > max_value) {
+        throw std::runtime_error(format("%s: invalid unsigned value '%s'", name, value));
     }
-    return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t) parsed;
+    return (uint32_t) parsed;
 }
 
 static llama_uma_buffer_load_order llama_model_env_load_order() {
@@ -1585,8 +1591,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const uint64_t GiB = 1024ull*1024ull*1024ull;
     const bool uma_loader_safe = ml.uma_loader_safe;
     const bool uma_loader_interleave_buffer_load = llama_model_env_bool("LLAMA_UMA_LOADER_INTERLEAVE_BUFFER_LOAD", false);
-    const uint32_t uma_loader_buffer_gate = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_GATE");
-    const uint32_t uma_loader_buffer_min_available_gib = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_MIN_AVAILABLE_GIB");
+    const uint32_t uma_loader_buffer_gate = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_GATE", 0, 3600);
+    const uint32_t uma_loader_buffer_min_available_gib = llama_model_env_u32("LLAMA_UMA_LOADER_BUFFER_MIN_AVAILABLE_GIB", 0, 4096);
     const llama_uma_buffer_load_order uma_loader_buffer_load_order = llama_model_env_load_order();
     const bool uma_buffer_gate_enabled = uma_loader_safe && uma_loader_buffer_gate > 0;
     const uint64_t uma_buffer_min_available =
@@ -1864,11 +1870,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         auto load_group = [&](const char * group_name, std::vector<std::pair<ggml_context *, llama_buf_map>> & group) -> bool {
             LLAMA_LOG_WARN("%s: UMA loader parallel group begin: %s, contexts = %zu\n", __func__, group_name, group.size());
-            for (auto & [ctx, buf_map] : group) {
-                if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL,
-                            params.progress_callback, params.progress_callback_user_data)) {
-                    return false;
+            try {
+                for (auto & [ctx, buf_map] : group) {
+                    if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                                params.progress_callback, params.progress_callback_user_data)) {
+                        ml.cancelled.store(true);
+                        return false;
+                    }
                 }
+            } catch (...) {
+                ml.cancelled.store(true);
+                throw;
             }
             LLAMA_LOG_WARN("%s: UMA loader parallel group end: %s\n", __func__, group_name);
             return true;
@@ -1881,8 +1893,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return load_group("local", local_maps);
         });
 
-        const bool remote_ok = remote_future.get();
-        const bool local_ok = local_future.get();
+        bool remote_ok = false;
+        bool local_ok = false;
+        std::exception_ptr load_exception;
+        try {
+            remote_ok = remote_future.get();
+        } catch (...) {
+            ml.cancelled.store(true);
+            load_exception = std::current_exception();
+        }
+        try {
+            local_ok = local_future.get();
+        } catch (...) {
+            ml.cancelled.store(true);
+            if (load_exception == nullptr) {
+                load_exception = std::current_exception();
+            }
+        }
+        if (load_exception != nullptr) {
+            std::rethrow_exception(load_exception);
+        }
         if (!remote_ok || !local_ok) {
             return false;
         }

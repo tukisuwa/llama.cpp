@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -43,17 +44,21 @@ static bool llama_env_bool(const char * name, bool fallback = false) {
     return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0;
 }
 
-static uint32_t llama_env_u32(const char * name, uint32_t fallback = 0) {
+static uint32_t llama_env_u32(const char * name, uint32_t fallback, uint32_t max_value) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
         return fallback;
     }
+    if (value[0] == '-' || value[0] == '+') {
+        throw std::runtime_error(format("%s: invalid unsigned value '%s'", name, value));
+    }
+    errno = 0;
     char * end = nullptr;
     const unsigned long parsed = std::strtoul(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return fallback;
+    if (errno == ERANGE || end == value || *end != '\0' || parsed > max_value) {
+        throw std::runtime_error(format("%s: invalid unsigned value '%s'", name, value));
     }
-    return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t) parsed;
+    return (uint32_t) parsed;
 }
 
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
@@ -307,11 +312,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
             uma_loader_safe,
-            llama_env_u32("LLAMA_UMA_LOADER_SLICE_MIB"),
-            llama_env_u32("LLAMA_UMA_LOADER_PSI_GATE"),
-            llama_env_u32("LLAMA_UMA_LOADER_MIN_AVAILABLE_GIB"),
-            llama_env_u32("LLAMA_UMA_LOADER_BUFFER_SLICE_LAYERS"),
-            llama_env_u32("LLAMA_UMA_LOADER_UPLOAD_CHUNK_MIB"),
+            llama_env_u32("LLAMA_UMA_LOADER_SLICE_MIB", 0, 65536),
+            llama_env_u32("LLAMA_UMA_LOADER_PSI_GATE", 0, 3600),
+            llama_env_u32("LLAMA_UMA_LOADER_MIN_AVAILABLE_GIB", 0, 4096),
+            llama_env_u32("LLAMA_UMA_LOADER_BUFFER_SLICE_LAYERS", 0, 65535),
+            llama_env_u32("LLAMA_UMA_LOADER_UPLOAD_CHUNK_MIB", 0, 65536),
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
