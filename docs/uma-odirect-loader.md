@@ -94,13 +94,15 @@ the UMA local O_DIRECT path. This is the class of difference that matters when
 you are about to load another model or increase context on a machine with less
 headroom.
 
-### Two-node Step-class GGUF over RPC
+### Two-node 200B-class GGUF over RPC
 
-A much larger Step-class Q4_K_S load was tested with two UMA nodes and RPC
-offload. Early standard-leaning loader paths were in the roughly `5:51` to
-`6:02` range and produced severe local memory PSI in at least one cache-disabled
-trial. An early safer path with RPC cache disabled but before the O_DIRECT
-streaming work loaded in about `3:12`.
+A much larger 200B-class sharded GGUF load was tested with two UMA nodes and
+RPC offload. The model was Q4-quantized and the loaded API metadata reported
+about 199B parameters with about 117 GiB of GGUF payload. Early
+standard-leaning loader paths were in the roughly `5:51` to `6:02` range and
+produced severe local memory PSI in at least one cache-disabled trial. An early
+safer path with RPC cache disabled but before the O_DIRECT streaming work
+loaded in about `3:12`.
 
 The current public UMA O_DIRECT path, using in-process local O_DIRECT reads,
 RPC tensor streaming, RPC cache disabled, `remote-first` buffer loading, and a
