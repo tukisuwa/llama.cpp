@@ -28,6 +28,89 @@ This branch adds controls to reduce full-buffer staging and to fail rather than
 silently falling back to mmap or ordinary buffered reads when an explicit UMA
 loader path was requested.
 
+This problem is easy to underestimate because the usual `free` output separates
+`used` from `buff/cache`. On Linux, file-backed page cache is often reclaimable,
+so `MemAvailable` is usually the right high-level signal. On memory-tight UMA
+systems, however, a large GGUF load can create a short window where page cache,
+backend tensor allocations, and staging buffers all overlap in the same physical
+RAM pool. If you only look at `used`, you can miss the real pressure.
+
+For load testing, record at least:
+
+- peak `used`
+- peak `buff/cache`
+- peak `used + buff/cache`
+- minimum `available`
+- swap usage
+- memory PSI and IO PSI
+
+If memory PSI rises during model load, treat that run as unsafe even when
+`MemAvailable` still looks large. PSI means the kernel is already stalling tasks
+on reclaim or memory pressure. On a desktop UMA machine this can feel like a
+temporary freeze; at larger sizes it can become unrecoverable without a hard
+reset.
+
+## What To Try Before This Branch
+
+If you want to stay within upstream llama.cpp behavior first, the practical
+mitigations are:
+
+- reduce `--ctx-size`, `--parallel`, batch/ubatch, and KV cache size
+- disable warmup for load tests with `--no-warmup`
+- avoid `--mlock` for memory-tight UMA model loads
+- avoid RPC local cache (`ggml-rpc-server -c`) unless you explicitly want the
+  RPC node to keep file-cache residency
+- compare `mmap`, `--no-mmap`, and `--direct-io` with RAM/PSI monitoring
+- drop page cache before controlled benchmarks only when you understand the
+  system-wide impact
+- stop other model servers before loading a large model
+
+These are still worth testing. For some 20-30 GiB GGUF loads, standard mmap can
+be fast and safe if there is enough headroom. The issue appears when the hidden
+page-cache-inclusive peak approaches the UMA memory limit, or when a multi-node
+load overlaps local reads, RPC transfer, and accelerator allocations.
+
+## Measured Examples
+
+The following measurements are from a DGX Spark-style UMA setup and are intended
+as shape-of-behavior examples, not universal performance claims. Always validate
+on your own filesystem, kernel, backend, and model.
+
+### Single-node 35B-class GGUF
+
+Model size was about 22 GiB. The test used `llama-server`, `ctx 8192`,
+`parallel 1`, `cache-ram 0`, full GPU offload, and no warmup. The file cache was
+advised away before each run.
+
+| loader path | model loaded | peak used | peak buff/cache | peak used + buff/cache | min available | memory PSI |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| standard mmap | `0:12.727` | `30.28 GiB` | `23.50 GiB` | `53.78 GiB` | `89.35 GiB` | `0.00/0.00` |
+| standard `--no-mmap` | `0:19.742` | `31.22 GiB` | `24.07 GiB` | `55.29 GiB` | `88.41 GiB` | `0.00/0.00` |
+| UMA local O_DIRECT | `0:11.305` | `31.21 GiB` | `2.94 GiB` | `34.14 GiB` | `88.42 GiB` | `0.00/0.00` |
+
+The standard mmap run was already safe in this case if judged by `available`
+and memory PSI. But the page-cache-inclusive peak was about 20 GiB higher than
+the UMA local O_DIRECT path. This is the class of difference that matters when
+you are about to load another model or increase context on a machine with less
+headroom.
+
+### Two-node Step-class GGUF over RPC
+
+A much larger Step-class Q4_K_S load was tested with two UMA nodes and RPC
+offload. Early standard-leaning loader paths were in the roughly `5:51` to
+`6:02` range and produced severe local memory PSI in at least one cache-disabled
+trial. An early safer path with RPC cache disabled but before the O_DIRECT
+streaming work loaded in about `3:12`.
+
+The current public UMA O_DIRECT path, using in-process local O_DIRECT reads,
+RPC tensor streaming, RPC cache disabled, `remote-first` buffer loading, and a
+local read limit of `3000 MiB/s`, loaded the same class of model in `0:51.612`
+with swap at `0` and memory PSI at `0.00/0.00` on both nodes.
+
+That result is not just a speedup. The important change is that the loader does
+not silently return to mmap/page-cache/full-buffer fallback paths after the user
+has explicitly requested the UMA-safe path.
+
 ## Primary Mode
 
 Build with RPC enabled when you want multi-node loading:
