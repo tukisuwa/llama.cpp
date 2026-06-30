@@ -1,5 +1,14 @@
 # llama.cpp
 
+> This fork/branch adds an experimental UMA O_DIRECT loader path for large GGUF
+> model loads on systems where CPU RAM, file cache, staging buffers, and
+> accelerator-visible memory share the same physical memory pool. It is intended
+> to fail closed instead of silently falling back to mmap/page-cache-heavy paths
+> when UMA-safe loading is explicitly requested.
+>
+> See [UMA O_DIRECT Loader](docs/uma-odirect-loader.md) for usage, RPC examples,
+> and operational cautions.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
