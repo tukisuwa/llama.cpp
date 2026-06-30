@@ -98,6 +98,12 @@ struct rpc_msg_hello_rsp {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
 };
 
+struct rpc_server_version {
+    uint8_t major;
+    uint8_t minor;
+    uint8_t patch;
+};
+
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
 };
@@ -383,6 +389,27 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC client-side implementation
 
+static std::mutex & rpc_server_versions_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+static std::unordered_map<const socket_t *, rpc_server_version> & rpc_server_versions() {
+    static std::unordered_map<const socket_t *, rpc_server_version> versions;
+    return versions;
+}
+
+static bool rpc_supports_set_tensor_from_file(const std::shared_ptr<socket_t> & sock) {
+    if (sock == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(rpc_server_versions_mutex());
+    auto it = rpc_server_versions().find(sock.get());
+    return it != rpc_server_versions().end() &&
+        it->second.major == RPC_PROTO_MAJOR_VERSION &&
+        (it->second.minor > 0 || it->second.patch >= 2);
+}
+
 // Performs HELLO handshake with transport auto-negotiation.
 // Advertises local capabilities via conn_caps; if the server responds with
 // matching capabilities, the socket is upgraded transparently.
@@ -402,6 +429,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     }
 
     sock->update_caps(response.conn_caps);
+    {
+        std::lock_guard<std::mutex> lock(rpc_server_versions_mutex());
+        rpc_server_versions()[sock.get()] = rpc_server_version { response.major, response.minor, response.patch };
+    }
     return true;
 }
 
@@ -561,6 +592,10 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(
     }
 
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (!rpc_supports_set_tensor_from_file(ctx->sock)) {
+        return false;
+    }
+
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     rpc_msg_set_tensor_from_file_req request {
         /*.tensor              =*/ rpc_tensor,
@@ -576,9 +611,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_file(
         { stream_endpoint, request.stream_endpoint_len },
         { path,            request.path_len },
     };
-    bool status = send_rpc_cmd_parts(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE, parts, 3) && recv_empty_msg(ctx->sock);
-    RPC_STATUS_ASSERT(status);
-    return status;
+    return send_rpc_cmd_parts(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE, parts, 3) && recv_empty_msg(ctx->sock);
 }
 
 bool ggml_backend_rpc_buffer_set_tensor_from_callback(

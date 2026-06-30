@@ -222,58 +222,58 @@ static bool llama_read_local_odirect(
 
     const uint64_t requested = size;
     const uint64_t aligned_offset = file_offset & ~(static_cast<uint64_t>(alignment) - 1);
-    const size_t skip = static_cast<size_t>(file_offset - aligned_offset);
-    if (skip + requested > aligned_buffer_size) {
+    const uint64_t end = file_offset + requested;
+    const uint64_t direct_end = end & ~(static_cast<uint64_t>(alignment) - 1);
+    const uint64_t direct_size = direct_end > aligned_offset ? direct_end - aligned_offset : 0;
+    if (direct_size > aligned_buffer_size) {
         return false;
     }
 
-    char * out = static_cast<char *>(aligned_buffer) + skip;
+    char * out = static_cast<char *>(aligned_buffer);
     *data = out;
 
     uint64_t copied = 0;
-    uint64_t read_pos = aligned_offset;
-    const uint64_t end = file_offset + requested;
-    while (copied < requested && read_pos < end) {
-        const uint64_t direct_left = file_size > read_pos ? file_size - read_pos : 0;
-        const size_t direct_cap = std::min<uint64_t>(aligned_buffer_size, direct_left);
-        const size_t direct_read = direct_cap & ~(alignment - 1);
-        if (direct_read == 0) {
-            break;
-        }
-
-        ssize_t n = ::pread(fd, aligned_buffer, direct_read, static_cast<off_t>(read_pos));
-        if (n < 0) {
-            if (errno == EINTR) {
+    uint64_t direct_done = 0;
+    while (direct_done < direct_size) {
+        ssize_t n = ::pread(fd,
+                static_cast<char *>(aligned_buffer) + direct_done,
+                direct_size - direct_done,
+                static_cast<off_t>(aligned_offset + direct_done));
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) {
                 continue;
             }
             return false;
         }
-        if (n == 0) {
-            break;
-        }
+        direct_done += static_cast<uint64_t>(n);
+    }
 
-        const uint64_t chunk_start = read_pos;
-        const uint64_t chunk_end = read_pos + static_cast<uint64_t>(n);
-        const uint64_t copy_start = std::max<uint64_t>(file_offset + copied, chunk_start);
-        const uint64_t copy_end = std::min<uint64_t>(end, chunk_end);
+    if (direct_size > 0) {
+        const uint64_t copy_start = std::max<uint64_t>(file_offset, aligned_offset);
+        const uint64_t copy_end = std::min<uint64_t>(end, aligned_offset + direct_size);
         if (copy_end > copy_start) {
-            copied += copy_end - copy_start;
+            const uint64_t copy_size = copy_end - copy_start;
+            memmove(out, static_cast<char *>(aligned_buffer) + (copy_start - aligned_offset), copy_size);
+            copied += copy_size;
         }
-
-        read_pos += static_cast<uint64_t>(n);
     }
 
     if (copied < requested) {
         if (tail_fd < 0) {
             return false;
         }
-        const size_t tail_size = static_cast<size_t>(requested - copied);
-        ssize_t n = ::pread(tail_fd, out + copied, tail_size, static_cast<off_t>(file_offset + copied));
-        if (n <= 0) {
-            return false;
+        while (copied < requested) {
+            const size_t tail_size = static_cast<size_t>(requested - copied);
+            ssize_t n = ::pread(tail_fd, out + copied, tail_size, static_cast<off_t>(file_offset + copied));
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                return false;
+            }
+            ::posix_fadvise(tail_fd, static_cast<off_t>(file_offset + copied), n, POSIX_FADV_DONTNEED);
+            copied += static_cast<uint64_t>(n);
         }
-        ::posix_fadvise(tail_fd, static_cast<off_t>(file_offset + copied), n, POSIX_FADV_DONTNEED);
-        copied += static_cast<uint64_t>(n);
     }
 
     return copied == requested;
@@ -1999,10 +1999,10 @@ bool llama_model_loader::load_all_data(
     bool logged_rpc_odirect_stream = false;
     bool logged_local_odirect_stream = false;
     bool logged_local_odirect_direct = false;
-    const char * rpc_odirect_stream_endpoint = std::getenv("GGML_RPC_ODIRECT_STREAM_ENDPOINT");
-    const char * rpc_odirect_stream_mode = std::getenv("GGML_RPC_ODIRECT_STREAM_MODE");
-    const char * local_odirect_stream_endpoint = std::getenv("GGML_LOCAL_ODIRECT_STREAM_ENDPOINT");
-    const char * local_odirect_stream_mode = std::getenv("GGML_LOCAL_ODIRECT_STREAM_MODE");
+    const char * rpc_odirect_stream_endpoint = uma_loader_safe ? std::getenv("GGML_RPC_ODIRECT_STREAM_ENDPOINT") : nullptr;
+    const char * rpc_odirect_stream_mode = uma_loader_safe ? std::getenv("GGML_RPC_ODIRECT_STREAM_MODE") : nullptr;
+    const char * local_odirect_stream_endpoint = uma_loader_safe ? std::getenv("GGML_LOCAL_ODIRECT_STREAM_ENDPOINT") : nullptr;
+    const char * local_odirect_stream_mode = uma_loader_safe ? std::getenv("GGML_LOCAL_ODIRECT_STREAM_MODE") : nullptr;
     const bool rpc_odirect_process_direct =
         rpc_odirect_stream_mode != nullptr && strcmp(rpc_odirect_stream_mode, "local") == 0;
     const bool local_odirect_stream_direct =
@@ -2145,6 +2145,7 @@ bool llama_model_loader::load_all_data(
                 std::lock_guard<std::mutex> lock(size_done_mutex);
                 current_size_done = size_done;
             }
+            std::lock_guard<std::mutex> lock(progress_callback_mutex);
             if (!progress_callback((float) current_size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
