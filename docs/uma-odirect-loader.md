@@ -78,9 +78,10 @@ on your own filesystem, kernel, backend, and model.
 
 ### Single-node 35B-class GGUF
 
-Model size was about 22 GiB. The test used `llama-server`, `ctx 8192`,
-`parallel 1`, `cache-ram 0`, full GPU offload, and no warmup. The file cache was
-advised away before each run.
+A 35B-class MoE GGUF was tested on a single UMA node. The model was an
+A3B-style MoE, Q4_K_M-quantized, with a GGUF payload of about 22 GiB. The test
+used `llama-server`, `ctx 8192`, `parallel 1`, `cache-ram 0`, full GPU offload,
+and no warmup. The file cache was advised away before each run.
 
 | loader path | model loaded | peak used | peak buff/cache | peak used + buff/cache | min available | memory PSI |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
