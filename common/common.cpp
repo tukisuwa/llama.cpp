@@ -1544,6 +1544,20 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.uma_loader_interleave_buffer_load = params.uma_loader_interleave_buffer_load;
+    mparams.uma_loader_safe = params.uma_loader_safe;
+    mparams.uma_loader_slice_mib = params.uma_loader_slice_mib < 0 ? 0 : params.uma_loader_slice_mib;
+    mparams.uma_loader_psi_gate  = params.uma_loader_psi_gate  < 0 ? 0 : params.uma_loader_psi_gate;
+    mparams.uma_loader_min_available_gib = params.uma_loader_min_available_gib < 0 ? 0 : params.uma_loader_min_available_gib;
+    mparams.uma_loader_buffer_slice_layers = params.uma_loader_buffer_slice_layers < 0 ? 0 : params.uma_loader_buffer_slice_layers;
+    mparams.uma_loader_buffer_gate = params.uma_loader_buffer_gate < 0 ? 0 : params.uma_loader_buffer_gate;
+    mparams.uma_loader_buffer_min_available_gib = params.uma_loader_buffer_min_available_gib < 0 ? 0 : params.uma_loader_buffer_min_available_gib;
+    mparams.uma_loader_upload_chunk_mib = params.uma_loader_upload_chunk_mib < 0 ? 0 : params.uma_loader_upload_chunk_mib;
+    mparams.uma_loader_buffer_load_order = params.uma_loader_buffer_load_order;
+
+    if (mparams.uma_loader_safe) {
+        mparams.use_mmap = false;
+    }
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

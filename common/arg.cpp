@@ -2404,6 +2404,113 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--uma-loader-safe"},
+        "reduce model-load page cache pressure on UMA systems (implies --no-mmap)",
+        [](common_params & params) {
+            params.uma_loader_safe = true;
+            params.use_mmap = false;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_SAFE"));
+    add_opt(common_arg(
+        {"--uma-loader-interleave-buffer-load"},
+        "UMA safe loader: allocate and load each backend buffer slice before allocating the next one",
+        [](common_params & params) {
+            params.uma_loader_interleave_buffer_load = true;
+            params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_INTERLEAVE_BUFFER_LOAD"));
+    add_opt(common_arg(
+        {"--uma-loader-buffer-load-order"}, "ORDER",
+        "UMA safe loader: backend buffer allocation/load order: default, round-robin, remote-first, parallel",
+        [](common_params & params, const std::string & value) {
+            if (value == "default") {
+                params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
+                params.uma_loader_interleave_buffer_load = false;
+            } else if (value == "round-robin") {
+                params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN;
+                params.uma_loader_interleave_buffer_load = true;
+            } else if (value == "remote-first") {
+                params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST;
+                params.uma_loader_interleave_buffer_load = true;
+            } else if (value == "parallel") {
+                params.uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
+                params.uma_loader_interleave_buffer_load = true;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_BUFFER_LOAD_ORDER"));
+    add_opt(common_arg(
+        {"--uma-loader-slice-mib"}, "N",
+        "UMA safe loader: synchronize and briefly yield every N MiB during tensor data loading (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_slice_mib = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_SLICE_MIB"));
+    add_opt(common_arg(
+        {"--uma-loader-psi-gate"}, "N",
+        "UMA safe loader: at slice boundaries, wait up to N seconds if memory PSI total increased (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_psi_gate = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_PSI_GATE"));
+    add_opt(common_arg(
+        {"--uma-loader-min-available-gib"}, "N",
+        "UMA safe loader: at slice boundaries, wait up to the PSI gate limit if MemAvailable is below N GiB (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_min_available_gib = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_MIN_AVAILABLE_GIB"));
+    add_opt(common_arg(
+        {"--uma-loader-buffer-slice-layers"}, "N",
+        "UMA safe loader: split weight backend buffers every N repeating layers (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_buffer_slice_layers = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_BUFFER_SLICE_LAYERS"));
+    add_opt(common_arg(
+        {"--uma-loader-buffer-gate"}, "N",
+        "UMA safe loader: after backend buffer allocation, wait up to N seconds if memory PSI moved or MemAvailable is below threshold (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_buffer_gate = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_BUFFER_GATE"));
+    add_opt(common_arg(
+        {"--uma-loader-buffer-min-available-gib"}, "N",
+        "UMA safe loader: backend buffer gate target minimum MemAvailable in GiB (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_buffer_min_available_gib = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_BUFFER_MIN_AVAILABLE_GIB"));
+    add_opt(common_arg(
+        {"--uma-loader-upload-chunk-mib"}, "N",
+        "UMA safe loader: async upload staging buffer size in MiB (0 = default)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.uma_loader_upload_chunk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_UMA_LOADER_UPLOAD_CHUNK_MIB"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

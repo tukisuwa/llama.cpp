@@ -573,6 +573,16 @@ struct common_params {
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
     bool use_mlock         = false; // use mlock to keep model in memory
+    bool uma_loader_safe   = false; // reduce model-load page cache pressure on UMA systems
+    bool uma_loader_interleave_buffer_load = false; // allocate and load each backend buffer slice before allocating the next one
+    int32_t uma_loader_slice_mib = 0; // 0 = disabled; synchronize/throttle model load every N MiB in UMA safe mode
+    int32_t uma_loader_psi_gate  = 0; // 0 = disabled; wait up to N seconds on memory PSI movement at slice boundary
+    int32_t uma_loader_min_available_gib = 0; // 0 = disabled; slice gate if MemAvailable is below N GiB
+    int32_t uma_loader_buffer_slice_layers = 0; // 0 = disabled; split weight backend buffers every N repeating layers
+    int32_t uma_loader_buffer_gate = 0; // 0 = disabled; wait up to N seconds after backend buffer allocations
+    int32_t uma_loader_buffer_min_available_gib = 0; // 0 = disabled; gate if MemAvailable is below N GiB
+    int32_t uma_loader_upload_chunk_mib = 0; // 0 = default; async upload staging buffer size in MiB
+    llama_uma_buffer_load_order uma_loader_buffer_load_order = LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading

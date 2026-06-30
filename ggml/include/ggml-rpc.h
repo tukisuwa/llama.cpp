@@ -22,6 +22,25 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
+GGML_BACKEND_API bool ggml_backend_rpc_buffer_set_tensor_from_file(
+        ggml_backend_buffer_t buffer,
+        struct ggml_tensor * tensor,
+        const char * stream_endpoint,
+        const char * path,
+        uint64_t file_offset,
+        size_t tensor_offset,
+        size_t size);
+
+typedef bool (*ggml_backend_rpc_read_callback)(void * user_data, void * data, size_t size);
+
+GGML_BACKEND_API bool ggml_backend_rpc_buffer_set_tensor_from_callback(
+        ggml_backend_buffer_t buffer,
+        struct ggml_tensor * tensor,
+        size_t tensor_offset,
+        size_t size,
+        void * user_data,
+        ggml_backend_rpc_read_callback callback);
+
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,

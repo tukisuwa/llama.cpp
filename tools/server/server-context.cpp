@@ -25,6 +25,16 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <string>
+#include <thread>
+#include <chrono>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -38,6 +48,181 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#if !defined(_WIN32)
+static std::string env_str(const char * name, const std::string & fallback = "") {
+    const char * value = std::getenv(name);
+    return value != nullptr ? std::string(value) : fallback;
+}
+
+static std::string endpoint_port(const std::string & endpoint) {
+    const size_t pos = endpoint.rfind(':');
+    if (pos == std::string::npos || pos + 1 >= endpoint.size()) {
+        return "";
+    }
+    return endpoint.substr(pos + 1);
+}
+
+static void set_child_env_if_nonempty(const char * name, const std::string & value) {
+    if (!value.empty()) {
+        setenv(name, value.c_str(), 1);
+    }
+}
+
+class server_odirect_stream_child {
+public:
+    ~server_odirect_stream_child() {
+        stop();
+    }
+
+    bool start(
+            const char * label,
+            const std::string & endpoint,
+            const std::string & bin,
+            const std::string & log,
+            const std::string & host,
+            const std::string & sched,
+            const std::string & remote_ip,
+            const std::string & local_max_active,
+            const std::string & remote_max_active,
+            const std::string & rate_limit_mibps) {
+        if (endpoint.empty()) {
+            return true;
+        }
+        const std::string port = endpoint_port(endpoint);
+        if (port.empty()) {
+            SRV_ERR("O_DIRECT streamer %s endpoint has no port: %s\n", label, endpoint.c_str());
+            return false;
+        }
+        if (bin.empty()) {
+            SRV_ERR("O_DIRECT streamer %s binary is empty\n", label);
+            return false;
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            SRV_ERR("failed to fork O_DIRECT streamer %s\n", label);
+            return false;
+        }
+        if (pid == 0) {
+            setsid();
+            int fd = -1;
+            if (!log.empty()) {
+                fd = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            } else {
+                fd = open("/dev/null", O_WRONLY);
+            }
+            if (fd >= 0) {
+                dup2(fd, STDOUT_FILENO);
+                dup2(fd, STDERR_FILENO);
+                close(fd);
+            }
+            int null_fd = open("/dev/null", O_RDONLY);
+            if (null_fd >= 0) {
+                dup2(null_fd, STDIN_FILENO);
+                close(null_fd);
+            }
+
+            set_child_env_if_nonempty("ODIRECT_STREAM_SCHED", sched);
+            set_child_env_if_nonempty("ODIRECT_STREAM_REMOTE_IP", remote_ip);
+            set_child_env_if_nonempty("ODIRECT_STREAM_LOCAL_MAX_ACTIVE", local_max_active);
+            set_child_env_if_nonempty("ODIRECT_STREAM_REMOTE_MAX_ACTIVE", remote_max_active);
+            set_child_env_if_nonempty("ODIRECT_STREAM_RATE_LIMIT_MIBPS", rate_limit_mibps);
+
+            execl(bin.c_str(), bin.c_str(), "server", host.c_str(), port.c_str(), static_cast<char *>(nullptr));
+            _exit(127);
+        }
+
+        child_label = label;
+        SRV_INF("started O_DIRECT streamer %s: pid %d endpoint %s\n", child_label.c_str(), (int) pid, endpoint.c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        int status = 0;
+        const pid_t exited = waitpid(pid, &status, WNOHANG);
+        if (exited == pid || kill(pid, 0) != 0) {
+            SRV_ERR("O_DIRECT streamer %s exited during startup\n", child_label.c_str());
+            pid = -1;
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        if (pid <= 0) {
+            return;
+        }
+        SRV_INF("stopping O_DIRECT streamer %s: pid %d\n", child_label.c_str(), (int) pid);
+        kill(pid, SIGTERM);
+        for (int i = 0; i < 20; ++i) {
+            int status = 0;
+            const pid_t done = waitpid(pid, &status, WNOHANG);
+            if (done == pid) {
+                pid = -1;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        pid = -1;
+    }
+
+private:
+    pid_t pid = -1;
+    std::string child_label;
+};
+
+class server_odirect_stream_scope {
+public:
+    bool start_from_env() {
+        if (env_str("GGML_ODIRECT_STREAM_SPAWN", "0") != "1") {
+            return true;
+        }
+
+        const std::string host = env_str("GGML_ODIRECT_STREAM_HOST", "0.0.0.0");
+
+        const std::string rpc_endpoint = env_str("GGML_RPC_ODIRECT_STREAM_ENDPOINT");
+        const std::string local_endpoint = env_str("GGML_LOCAL_ODIRECT_STREAM_ENDPOINT");
+        const std::string rpc_mode = env_str("GGML_RPC_ODIRECT_STREAM_MODE", "stream");
+        const std::string local_mode = env_str("GGML_LOCAL_ODIRECT_STREAM_MODE", "direct");
+
+        if (rpc_mode != "local" && !remote.start(
+                    "remote",
+                    rpc_endpoint,
+                    env_str("GGML_RPC_ODIRECT_STREAM_BIN", env_str("GGML_ODIRECT_STREAM_BIN")),
+                    env_str("GGML_RPC_ODIRECT_STREAM_LOG", "/data/shared/research/logs/odirect-stream-step37.log"),
+                    host,
+                    env_str("GGML_RPC_ODIRECT_STREAM_SCHED", "none"),
+                    env_str("GGML_RPC_ODIRECT_STREAM_REMOTE_IP", "192.168.100.10"),
+                    env_str("GGML_RPC_ODIRECT_STREAM_LOCAL_MAX_ACTIVE", "0"),
+                    env_str("GGML_RPC_ODIRECT_STREAM_REMOTE_MAX_ACTIVE", "0"),
+                    env_str("GGML_RPC_ODIRECT_STREAM_RATE_LIMIT_MIBPS", "0"))) {
+            return false;
+        }
+
+        if (local_mode != "local" && !local_endpoint.empty() && local_endpoint != rpc_endpoint) {
+            if (!local.start(
+                        "local",
+                        local_endpoint,
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_BIN", env_str("GGML_ODIRECT_STREAM_BIN")),
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_LOG", "/data/shared/research/logs/odirect-stream-step37-local.log"),
+                        host,
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_SCHED", "none"),
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_REMOTE_IP", "192.168.100.10"),
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_LOCAL_MAX_ACTIVE", "0"),
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_REMOTE_MAX_ACTIVE", "0"),
+                        env_str("GGML_LOCAL_ODIRECT_STREAM_RATE_LIMIT_MIBPS", "0"))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+private:
+    server_odirect_stream_child remote;
+    server_odirect_stream_child local;
+};
+#endif
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -1158,6 +1343,14 @@ private:
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
+
+#if !defined(_WIN32)
+        server_odirect_stream_scope odirect_stream_scope;
+        if (!odirect_stream_scope.start_from_env()) {
+            SRV_ERR("%s", "failed to start O_DIRECT streamer child process\n");
+            return false;
+        }
+#endif
 
         llama_init = common_init_from_params(params_base);
 

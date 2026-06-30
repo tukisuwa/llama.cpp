@@ -20,6 +20,7 @@ struct llama_file {
 
     size_t tell() const;
     size_t size() const;
+    const std::string & path() const;
 
     int file_id() const; // fileno overload
 
@@ -35,6 +36,8 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    void advise_dontneed(size_t offset, size_t len) const;
+    void advise_noreuse(size_t offset, size_t len) const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -42,7 +45,7 @@ private:
 
 struct llama_mmap {
     llama_mmap(const llama_mmap &) = delete;
-    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false);
+    llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false, bool uma_loader_safe = false);
     ~llama_mmap();
 
     size_t size() const;

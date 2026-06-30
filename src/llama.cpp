@@ -280,6 +280,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
+            params.uma_loader_safe, params.uma_loader_slice_mib, params.uma_loader_psi_gate, params.uma_loader_min_available_gib,
+            params.uma_loader_buffer_slice_layers, params.uma_loader_upload_chunk_mib,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
@@ -578,4 +580,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

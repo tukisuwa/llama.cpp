@@ -23,18 +23,56 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+static uint64_t llama_model_memory_psi_total() {
+    std::ifstream psi("/proc/pressure/memory");
+    std::string line;
+    while (std::getline(psi, line)) {
+        if (line.rfind("some ", 0) != 0) {
+            continue;
+        }
+        const std::string key = "total=";
+        const size_t pos = line.find(key);
+        if (pos == std::string::npos) {
+            return 0;
+        }
+        try {
+            return std::stoull(line.substr(pos + key.size()));
+        } catch (...) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static uint64_t llama_model_mem_available_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t value_kib = 0;
+    std::string unit;
+    while (meminfo >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            return value_kib * 1024;
+        }
+    }
+    return 0;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1227,6 +1265,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+    if (ml.uma_loader_buffer_slice_layers > 0) {
+        LLAMA_LOG_INFO("%s: UMA loader backend buffer slicing enabled, repeating layer group size = %u\n",
+                __func__, ml.uma_loader_buffer_slice_layers);
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
@@ -1500,7 +1542,133 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    const uint64_t GiB = 1024ull*1024ull*1024ull;
+    const bool uma_buffer_gate_enabled = params.uma_loader_safe && params.uma_loader_buffer_gate > 0;
+    const uint64_t uma_buffer_min_available =
+        params.uma_loader_buffer_min_available_gib > 0 ? (uint64_t) params.uma_loader_buffer_min_available_gib * GiB : 0;
+
+    if (uma_buffer_gate_enabled) {
+        LLAMA_LOG_INFO("%s: UMA loader backend buffer gate enabled, max wait = %u s, min MemAvailable = %u GiB\n",
+                __func__, params.uma_loader_buffer_gate, params.uma_loader_buffer_min_available_gib);
+    }
+    const bool uma_interleaved_load_order =
+        params.uma_loader_buffer_load_order != LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ||
+        params.uma_loader_interleave_buffer_load;
+
+    const bool uma_parallel_load_order =
+        params.uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
+
+    if (uma_interleaved_load_order && !ml.no_alloc) {
+        LLAMA_LOG_INFO("%s: UMA loader interleaved backend buffer allocation and tensor loading enabled\n", __func__);
+    }
+    if (uma_parallel_load_order && !ml.no_alloc) {
+        LLAMA_LOG_WARN("%s: UMA loader parallel local/remote tensor loading enabled; backend buffers are allocated before parallel load\n", __func__);
+    }
+
+    auto uma_backend_buffer_gate = [&](const char * buft_name, size_t buf_size, uint64_t psi_before) {
+        if (!uma_buffer_gate_enabled) {
+            return;
+        }
+
+        uint64_t psi_now = llama_model_memory_psi_total();
+        uint64_t available_now = llama_model_mem_available_bytes();
+        bool psi_moved = psi_now > psi_before;
+        bool low_available = uma_buffer_min_available > 0 && available_now > 0 && available_now < uma_buffer_min_available;
+
+        if (!psi_moved && !low_available) {
+            return;
+        }
+
+        LLAMA_LOG_WARN("%s: UMA backend buffer gate after %s %.2f MiB: psi %llu -> %llu, MemAvailable %.2f GiB, waiting up to %u s\n",
+                __func__, buft_name, buf_size / 1024.0 / 1024.0,
+                (unsigned long long) psi_before, (unsigned long long) psi_now,
+                available_now / 1024.0 / 1024.0 / 1024.0, params.uma_loader_buffer_gate);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(params.uma_loader_buffer_gate);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+            const uint64_t psi_next = llama_model_memory_psi_total();
+            const uint64_t available_next = llama_model_mem_available_bytes();
+            const bool psi_stable = psi_next == psi_now;
+            const bool available_ok = uma_buffer_min_available == 0 || available_next == 0 || available_next >= uma_buffer_min_available;
+
+            psi_now = psi_next;
+            available_now = available_next;
+
+            if (psi_stable && available_ok) {
+                break;
+            }
+        }
+    };
+
+    std::vector<decltype(ml.ctx_map.begin())> ctx_order;
+    ctx_order.reserve(ml.ctx_map.size());
+    if (uma_interleaved_load_order && !ml.no_alloc) {
+        struct ctx_buft_group {
+            ggml_backend_buffer_type_t buft;
+            std::vector<decltype(ml.ctx_map.begin())> items;
+        };
+
+        std::vector<ctx_buft_group> groups;
+        for (auto it = ml.ctx_map.begin(); it != ml.ctx_map.end(); ++it) {
+            auto group = std::find_if(groups.begin(), groups.end(), [&](const ctx_buft_group & cur) {
+                return cur.buft == it->first.buft;
+            });
+            if (group == groups.end()) {
+                groups.push_back({ it->first.buft, {} });
+                group = groups.end() - 1;
+            }
+            group->items.push_back(it);
+        }
+
+        const auto load_order = params.uma_loader_buffer_load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT ?
+            LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN : params.uma_loader_buffer_load_order;
+
+        if (load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST || load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL) {
+            auto is_remote_group = [](const ctx_buft_group & group) {
+                const char * name = ggml_backend_buft_name(group.buft);
+                return strncmp(name, "RPC", 3) == 0;
+            };
+            for (const auto & group : groups) {
+                if (is_remote_group(group)) {
+                    ctx_order.insert(ctx_order.end(), group.items.begin(), group.items.end());
+                }
+            }
+            for (const auto & group : groups) {
+                if (!is_remote_group(group)) {
+                    ctx_order.insert(ctx_order.end(), group.items.begin(), group.items.end());
+                }
+            }
+            LLAMA_LOG_WARN("%s: UMA loader %s backend buffer/load order enabled across %zu buffer types\n",
+                    __func__, load_order == LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL ? "parallel" : "remote-first", groups.size());
+        } else {
+            size_t max_group_size = 0;
+            for (const auto & group : groups) {
+                max_group_size = std::max(max_group_size, group.items.size());
+            }
+
+            for (size_t i = 0; i < max_group_size; ++i) {
+                for (const auto & group : groups) {
+                    if (i < group.items.size()) {
+                        ctx_order.push_back(group.items[i]);
+                    }
+                }
+            }
+
+            LLAMA_LOG_WARN("%s: UMA loader round-robin backend buffer/load order enabled across %zu buffer types\n",
+                    __func__, groups.size());
+        }
+    } else {
+        for (auto it = ml.ctx_map.begin(); it != ml.ctx_map.end(); ++it) {
+            ctx_order.push_back(it);
+        }
+    }
+
+    for (auto it : ctx_order) {
+        const auto & ctx_key = it->first;
+        auto & ctx_ptr = it->second;
+        ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
@@ -1540,10 +1708,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                const uint64_t psi_before = llama_model_memory_psi_total();
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
+                uma_backend_buffer_gate(ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf), psi_before);
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
@@ -1555,7 +1725,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                const uint64_t psi_before = llama_model_memory_psi_total();
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf != nullptr) {
+                    uma_backend_buffer_gate(ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(buf), psi_before);
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1580,7 +1754,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
+        if (uma_interleaved_load_order && !uma_parallel_load_order && !ml.no_alloc) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
+        } else {
+            ctx_buf_maps.emplace_back(ctx, buf_map);
+        }
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1612,9 +1792,55 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    if (uma_parallel_load_order && !ml.no_alloc) {
+        std::vector<std::pair<ggml_context *, llama_buf_map>> remote_maps;
+        std::vector<std::pair<ggml_context *, llama_buf_map>> local_maps;
+        remote_maps.reserve(ctx_buf_maps.size());
+        local_maps.reserve(ctx_buf_maps.size());
+
+        for (auto & item : ctx_buf_maps) {
+            ggml_tensor * first = ggml_get_first_tensor(item.first);
+            if (first == nullptr || first->buffer == nullptr) {
+                local_maps.emplace_back(item.first, std::move(item.second));
+                continue;
+            }
+            const char * buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(first->buffer));
+            if (strncmp(buft_name, "RPC", 3) == 0) {
+                remote_maps.emplace_back(item.first, std::move(item.second));
+            } else {
+                local_maps.emplace_back(item.first, std::move(item.second));
+            }
+        }
+
+        auto load_group = [&](const char * group_name, std::vector<std::pair<ggml_context *, llama_buf_map>> & group) -> bool {
+            LLAMA_LOG_WARN("%s: UMA loader parallel group begin: %s, contexts = %zu\n", __func__, group_name, group.size());
+            for (auto & [ctx, buf_map] : group) {
+                if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL,
+                            params.progress_callback, params.progress_callback_user_data)) {
+                    return false;
+                }
+            }
+            LLAMA_LOG_WARN("%s: UMA loader parallel group end: %s\n", __func__, group_name);
+            return true;
+        };
+
+        auto remote_future = std::async(std::launch::async, [&]() {
+            return load_group("remote", remote_maps);
+        });
+        auto local_future = std::async(std::launch::async, [&]() {
+            return load_group("local", local_maps);
+        });
+
+        const bool remote_ok = remote_future.get();
+        const bool local_ok = local_future.get();
+        if (!remote_ok || !local_ok) {
             return false;
+        }
+    } else if (!uma_interleaved_load_order) {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
         }
     }
 
@@ -2291,6 +2517,14 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.uma_loader_slice_mib        =*/ 0,
+        /*.uma_loader_psi_gate         =*/ 0,
+        /*.uma_loader_min_available_gib =*/ 0,
+        /*.uma_loader_buffer_slice_layers =*/ 0,
+        /*.uma_loader_buffer_gate      =*/ 0,
+        /*.uma_loader_buffer_min_available_gib =*/ 0,
+        /*.uma_loader_upload_chunk_mib =*/ 0,
+        /*.uma_loader_buffer_load_order =*/ LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
@@ -2298,6 +2532,8 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.uma_loader_interleave_buffer_load =*/ false,
+        /*.uma_loader_safe             =*/ false,
         /*.no_alloc                    =*/ false,
     };
 

@@ -879,7 +879,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     const llama_model_kv_override * kv_overrides = params->kv_overrides;
     std::vector<std::string> splits = {};
     llama_model_loader ml(/*metadata*/ nullptr, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr,
-        fname_inp, splits, /*file*/ nullptr, use_mmap, /*use_direct_io*/ false, /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
+        fname_inp, splits, /*file*/ nullptr, use_mmap, /*use_direct_io*/ false, /*uma_loader_safe*/ false,
+        /*uma_loader_slice_mib*/ 0, /*uma_loader_psi_gate*/ 0, /*uma_loader_min_available_gib*/ 0,
+        /*uma_loader_buffer_slice_layers*/ 0, /*uma_loader_upload_chunk_mib*/ 0,
+        /*check_tensors*/ true, /*no_alloc*/ false, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
 
     auto mparams = llama_model_default_params();

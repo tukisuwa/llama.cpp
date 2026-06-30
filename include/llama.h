@@ -198,6 +198,13 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    enum llama_uma_buffer_load_order {
+        LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT      = 0,
+        LLAMA_UMA_BUFFER_LOAD_ORDER_ROUND_ROBIN  = 1,
+        LLAMA_UMA_BUFFER_LOAD_ORDER_REMOTE_FIRST = 2,
+        LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL     = 3,
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -315,6 +322,15 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        uint32_t uma_loader_slice_mib; // 0 = disabled; throttle/synchronize model load every N MiB in UMA safe mode
+        uint32_t uma_loader_psi_gate;  // wait up to N seconds if memory PSI total increases at a slice boundary
+        uint32_t uma_loader_min_available_gib; // 0 = disabled; gate at slice boundaries while MemAvailable is below N GiB
+        uint32_t uma_loader_buffer_slice_layers; // 0 = disabled; split weight backend buffers every N repeating layers
+        uint32_t uma_loader_buffer_gate; // wait up to N seconds after each backend buffer allocation
+        uint32_t uma_loader_buffer_min_available_gib; // 0 = disabled; gate while MemAvailable is below N GiB
+        uint32_t uma_loader_upload_chunk_mib; // 0 = default; async upload staging buffer size in MiB
+        enum llama_uma_buffer_load_order uma_loader_buffer_load_order; // UMA safe loader backend buffer allocation/load order
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -323,6 +339,8 @@ extern "C" {
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
+        bool uma_loader_interleave_buffer_load; // allocate and load each backend buffer slice before allocating the next one
+        bool uma_loader_safe; // reduce model-load page cache pressure on UMA systems
         bool no_alloc;        // only load metadata and simulate memory allocations
     };
 

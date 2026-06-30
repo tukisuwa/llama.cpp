@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-rpc.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -10,12 +11,398 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <fstream>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+struct llama_psi_totals {
+    uint64_t some = 0;
+    uint64_t full = 0;
+};
+
+static llama_psi_totals llama_memory_psi_totals() {
+    std::ifstream psi("/proc/pressure/memory");
+    std::string line;
+    llama_psi_totals result;
+    while (std::getline(psi, line)) {
+        const bool is_some = line.rfind("some ", 0) == 0;
+        const bool is_full = line.rfind("full ", 0) == 0;
+        if (!is_some && !is_full) {
+            continue;
+        }
+        const std::string key = "total=";
+        const size_t pos = line.find(key);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        try {
+            uint64_t value = std::stoull(line.substr(pos + key.size()));
+            if (is_some) {
+                result.some = value;
+            } else {
+                result.full = value;
+            }
+        } catch (...) {
+            continue;
+        }
+    }
+    return result;
+}
+
+static uint64_t llama_mem_available_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t value_kib = 0;
+    std::string unit;
+    while (meminfo >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            return value_kib * 1024;
+        }
+    }
+    return 0;
+}
+
+#ifndef _WIN32
+static uint64_t llama_htonll(uint64_t v) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (static_cast<uint64_t>(htonl(static_cast<uint32_t>(v))) << 32) | htonl(static_cast<uint32_t>(v >> 32));
+#else
+    return v;
+#endif
+}
+
+static uint64_t llama_ntohll(uint64_t v) {
+    return llama_htonll(v);
+}
+
+static bool llama_socket_send_all(int fd, const void * data, size_t size) {
+    const char * p = static_cast<const char *>(data);
+    while (size > 0) {
+        ssize_t n = ::send(fd, p, size, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        p += n;
+        size -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool llama_socket_recv_all(int fd, void * data, size_t size) {
+    char * p = static_cast<char *>(data);
+    while (size > 0) {
+        ssize_t n = ::recv(fd, p, size, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        p += n;
+        size -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool llama_parse_ipv4_endpoint(const char * endpoint, std::string & host, int & port) {
+    if (endpoint == nullptr) {
+        return false;
+    }
+    std::string value(endpoint);
+    const size_t sep = value.rfind(':');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= value.size()) {
+        return false;
+    }
+    host = value.substr(0, sep);
+    try {
+        port = std::stoi(value.substr(sep + 1));
+    } catch (...) {
+        return false;
+    }
+    return port > 0 && port <= 65535;
+}
+
+static bool llama_read_from_odirect_stream(
+        const char * endpoint,
+        const char * path,
+        uint64_t file_offset,
+        void * data,
+        size_t size) {
+    std::string host;
+    int port = 0;
+    if (!llama_parse_ipv4_endpoint(endpoint, host, port) || path == nullptr || data == nullptr) {
+        return false;
+    }
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1 ||
+            ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return false;
+    }
+
+    const uint32_t path_len = (uint32_t) strlen(path);
+    const uint32_t path_len_net = htonl(path_len);
+    const uint64_t offset_net = llama_htonll(file_offset);
+    const uint64_t size_net = llama_htonll(size);
+    if (!llama_socket_send_all(fd, &path_len_net, sizeof(path_len_net)) ||
+            !llama_socket_send_all(fd, &offset_net, sizeof(offset_net)) ||
+            !llama_socket_send_all(fd, &size_net, sizeof(size_net)) ||
+            !llama_socket_send_all(fd, path, path_len)) {
+        ::close(fd);
+        return false;
+    }
+
+    uint64_t response_size_net = 0;
+    if (!llama_socket_recv_all(fd, &response_size_net, sizeof(response_size_net))) {
+        ::close(fd);
+        return false;
+    }
+    const uint64_t response_size = llama_ntohll(response_size_net);
+    if (response_size != size) {
+        ::close(fd);
+        return false;
+    }
+
+    const bool ok = llama_socket_recv_all(fd, data, size);
+    ::close(fd);
+    return ok;
+}
+
+struct llama_aligned_free {
+    void operator()(void * p) const {
+        free(p);
+    }
+};
+
+static bool llama_read_local_odirect(
+        int fd,
+        int tail_fd,
+        uint64_t file_size,
+        uint64_t file_offset,
+        size_t size,
+        void * aligned_buffer,
+        size_t aligned_buffer_size,
+        void ** data) {
+    constexpr size_t alignment = 4096;
+    if (fd < 0 || aligned_buffer == nullptr || data == nullptr || file_offset > file_size) {
+        return false;
+    }
+
+    const uint64_t requested = std::min<uint64_t>(size, file_size - file_offset);
+    const uint64_t aligned_offset = file_offset & ~(static_cast<uint64_t>(alignment) - 1);
+    const size_t skip = static_cast<size_t>(file_offset - aligned_offset);
+    if (skip + requested > aligned_buffer_size) {
+        return false;
+    }
+
+    char * out = static_cast<char *>(aligned_buffer) + skip;
+    *data = out;
+
+    uint64_t copied = 0;
+    uint64_t read_pos = aligned_offset;
+    const uint64_t end = file_offset + requested;
+    while (copied < requested && read_pos < end) {
+        const uint64_t direct_left = file_size > read_pos ? file_size - read_pos : 0;
+        const size_t direct_cap = std::min<uint64_t>(aligned_buffer_size, direct_left);
+        const size_t direct_read = direct_cap & ~(alignment - 1);
+        if (direct_read == 0) {
+            break;
+        }
+
+        ssize_t n = ::pread(fd, aligned_buffer, direct_read, static_cast<off_t>(read_pos));
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            break;
+        }
+
+        const uint64_t chunk_start = read_pos;
+        const uint64_t chunk_end = read_pos + static_cast<uint64_t>(n);
+        const uint64_t copy_start = std::max<uint64_t>(file_offset + copied, chunk_start);
+        const uint64_t copy_end = std::min<uint64_t>(end, chunk_end);
+        if (copy_end > copy_start) {
+            copied += copy_end - copy_start;
+        }
+
+        read_pos += static_cast<uint64_t>(n);
+    }
+
+    if (copied < requested) {
+        if (tail_fd < 0) {
+            return false;
+        }
+        const size_t tail_size = static_cast<size_t>(requested - copied);
+        ssize_t n = ::pread(tail_fd, out + copied, tail_size, static_cast<off_t>(file_offset + copied));
+        if (n <= 0) {
+            return false;
+        }
+        ::posix_fadvise(tail_fd, static_cast<off_t>(file_offset + copied), n, POSIX_FADV_DONTNEED);
+        copied += static_cast<uint64_t>(n);
+    }
+
+    return copied == requested;
+}
+
+static double llama_env_double(const char * name, double fallback) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    try {
+        return std::stod(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static bool llama_env_equals(const char * name, const char * expected) {
+    const char * value = std::getenv(name);
+    return value != nullptr && strcmp(value, expected) == 0;
+}
+
+static void llama_odirect_rate_limit_impl(size_t bytes, double limit_mibps, std::mutex & mutex, std::chrono::steady_clock::time_point & next_time) {
+    if (limit_mibps <= 0.0 || bytes == 0) {
+        return;
+    }
+    const double seconds = (bytes / 1024.0 / 1024.0) / limit_mibps;
+    std::unique_lock<std::mutex> lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (next_time < now) {
+        next_time = now;
+    }
+    const auto wait_until = next_time;
+    next_time += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+    lock.unlock();
+    std::this_thread::sleep_until(wait_until);
+}
+
+static bool llama_odirect_rate_limit_weighted(bool rpc, size_t bytes) {
+    static const bool enabled = llama_env_equals("GGML_ODIRECT_READ_SCHEDULER", "weighted");
+    static const double total_mibps = llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0);
+    static const double rpc_weight = llama_env_double("GGML_RPC_ODIRECT_READ_WEIGHT", 1.0);
+    static const double local_weight = llama_env_double("GGML_LOCAL_ODIRECT_READ_WEIGHT", 1.0);
+    static const double weight_sum = std::max(0.0, rpc_weight) + std::max(0.0, local_weight);
+    static std::mutex global_mutex;
+    static std::mutex rpc_mutex;
+    static std::mutex local_mutex;
+    static auto global_next_time = std::chrono::steady_clock::now();
+    static auto rpc_next_time = std::chrono::steady_clock::now();
+    static auto local_next_time = std::chrono::steady_clock::now();
+
+    if (!enabled || total_mibps <= 0.0 || weight_sum <= 0.0) {
+        return false;
+    }
+
+    const double path_weight = rpc ? std::max(0.0, rpc_weight) : std::max(0.0, local_weight);
+    if (path_weight <= 0.0) {
+        return true;
+    }
+
+    const double path_mibps = total_mibps * path_weight / weight_sum;
+    llama_odirect_rate_limit_impl(bytes, total_mibps, global_mutex, global_next_time);
+    llama_odirect_rate_limit_impl(bytes, path_mibps, rpc ? rpc_mutex : local_mutex, rpc ? rpc_next_time : local_next_time);
+    return true;
+}
+
+static void llama_odirect_rate_limit_rpc(size_t bytes) {
+    if (llama_odirect_rate_limit_weighted(true, bytes)) {
+        return;
+    }
+    static const double limit_mibps = llama_env_double(
+            "GGML_RPC_ODIRECT_READ_RATE_LIMIT_MIBPS",
+            llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0));
+    static std::mutex mutex;
+    static auto next_time = std::chrono::steady_clock::now();
+    llama_odirect_rate_limit_impl(bytes, limit_mibps, mutex, next_time);
+}
+
+static void llama_odirect_rate_limit_local(size_t bytes) {
+    if (llama_odirect_rate_limit_weighted(false, bytes)) {
+        return;
+    }
+    static const double limit_mibps = llama_env_double(
+            "GGML_LOCAL_ODIRECT_READ_RATE_LIMIT_MIBPS",
+            llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0));
+    static std::mutex mutex;
+    static auto next_time = std::chrono::steady_clock::now();
+    llama_odirect_rate_limit_impl(bytes, limit_mibps, mutex, next_time);
+}
+
+struct llama_rpc_odirect_read_state {
+    int fd = -1;
+    int tail_fd = -1;
+    uint64_t file_size = 0;
+    uint64_t file_offset = 0;
+    uint64_t copied = 0;
+    void * aligned_buffer = nullptr;
+    size_t aligned_buffer_size = 0;
+    double read_ms = 0.0;
+    size_t chunks = 0;
+};
+
+static bool llama_rpc_odirect_read_callback(void * user_data, void * data, size_t size) {
+    auto * state = static_cast<llama_rpc_odirect_read_state *>(user_data);
+    if (state == nullptr) {
+        return false;
+    }
+    void * data_ptr = nullptr;
+    llama_odirect_rate_limit_rpc(size);
+    const auto time_before = std::chrono::steady_clock::now();
+    const bool ok = llama_read_local_odirect(
+            state->fd,
+            state->tail_fd,
+            state->file_size,
+            state->file_offset + state->copied,
+            size,
+            state->aligned_buffer,
+            state->aligned_buffer_size,
+            &data_ptr);
+    if (!ok || data_ptr == nullptr) {
+        return false;
+    }
+    memcpy(data, data_ptr, size);
+    const auto time_after = std::chrono::steady_clock::now();
+    state->read_ms += std::chrono::duration<double, std::milli>(time_after - time_before).count();
+    state->copied += size;
+    state->chunks++;
+    return true;
+}
+#endif
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -521,6 +908,12 @@ llama_model_loader::llama_model_loader(
         FILE * file,
         bool use_mmap,
         bool use_direct_io,
+        bool uma_loader_safe,
+        uint32_t uma_loader_slice_mib,
+        uint32_t uma_loader_psi_gate,
+        uint32_t uma_loader_min_available_gib,
+        uint32_t uma_loader_buffer_slice_layers,
+        uint32_t uma_loader_upload_chunk_mib,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
@@ -817,8 +1210,19 @@ llama_model_loader::llama_model_loader(
         use_mmap = false;
     }
 
+    if (uma_loader_safe && use_mmap) {
+        LLAMA_LOG_WARN("%s: UMA loader safe mode disables mmap to reduce page cache pressure\n", __func__);
+        use_mmap = false;
+    }
+
     this->use_mmap = use_mmap;
     this->use_direct_io = use_direct_io;
+    this->uma_loader_safe = uma_loader_safe;
+    this->uma_loader_slice_mib = uma_loader_slice_mib;
+    this->uma_loader_psi_gate = uma_loader_psi_gate;
+    this->uma_loader_min_available_gib = uma_loader_min_available_gib;
+    this->uma_loader_buffer_slice_layers = uma_loader_buffer_slice_layers;
+    this->uma_loader_upload_chunk_mib = uma_loader_upload_chunk_mib;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
 }
@@ -1050,10 +1454,11 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int32_t slice) -> ggml_context * {
+        const ctx_key key { buft, slice };
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
-            // one ggml context per buffer type
+            // one ggml context per buffer type, or per buffer slice when explicitly requested
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
@@ -1073,13 +1478,32 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("failed to create ggml context"));
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }
         return it->second.get();
     };
 
+    auto buffer_slice_for_tensor = [&](const llm_tensor_info & info) -> int32_t {
+        if (uma_loader_buffer_slice_layers == 0) {
+            return 0;
+        }
+
+        switch (info.layer) {
+            case LLM_TENSOR_LAYER_INPUT:
+                return -1;
+            case LLM_TENSOR_LAYER_OUTPUT:
+                return INT32_MAX;
+            case LLM_TENSOR_LAYER_REPEATING:
+                GGML_ASSERT(tn.bid >= 0);
+                return tn.bid / (int32_t) uma_loader_buffer_slice_layers;
+            default:
+                GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+        }
+    };
+
+    int32_t selected_buffer_slice = 0;
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
@@ -1137,6 +1561,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 GGML_ABORT("repeating layer tensor %s used without a layer number", tn.str().c_str());
             }
         }
+
+        selected_buffer_slice = buffer_slice_for_tensor(info);
 
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
@@ -1247,7 +1673,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft, selected_buffer_slice);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1258,7 +1684,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(buft, selected_buffer_slice);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1351,7 +1777,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa, uma_loader_safe);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1401,6 +1827,9 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         const auto & file = files.at(w.idx);
         file->seek(w.offs, SEEK_SET);
         file->read_raw(cur->data, ggml_nbytes(cur));
+        if (uma_loader_safe) {
+            file->advise_dontneed(w.offs, ggml_nbytes(cur));
+        }
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1432,11 +1861,20 @@ bool llama_model_loader::load_all_data(
     size_t alignment = 1;
     for (const auto & file : files) {
         alignment = std::max(file->read_alignment(), alignment);
+        if (uma_loader_safe) {
+            file->advise_noreuse(0, file->size());
+        }
     }
 
-    // Buffer size: balance between memory usage and I/O efficiency
-    // 64MB works well for NVMe drives
-    const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    // Buffer size: balance between memory usage and I/O efficiency.
+    // Upstream defaults to 1 MiB for ordinary reads; UMA safe loads can override this
+    // to better match large local NVMe reads without enabling O_DIRECT globally.
+    const size_t default_buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
+    const size_t requested_buffer_size =
+        (uma_loader_safe && uma_loader_upload_chunk_mib > 0) ? (size_t) uma_loader_upload_chunk_mib * MiB : 0;
+    const size_t buffer_size = requested_buffer_size > 0 ?
+        (alignment != 1 ? requested_buffer_size + 2 * alignment : requested_buffer_size) :
+        default_buffer_size;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1517,11 +1955,104 @@ bool llama_model_loader::load_all_data(
     }(__func__);
 
     if (upload_backend) {
-        LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
+        LLAMA_LOG_WARN("%s: using async uploads for device %s, buffer type %s, backend %s, staging buffers = %zu x %.2f MiB\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
-            ggml_backend_name(upload_backend));
+            ggml_backend_name(upload_backend),
+            n_buffers, buffer_size / 1024.0 / 1024.0);
     }
+    bool logged_chunked_tensor_set = false;
+    bool logged_rpc_odirect_stream = false;
+    bool logged_local_odirect_stream = false;
+    bool logged_local_odirect_direct = false;
+    const char * rpc_odirect_stream_endpoint = std::getenv("GGML_RPC_ODIRECT_STREAM_ENDPOINT");
+    const char * rpc_odirect_stream_mode = std::getenv("GGML_RPC_ODIRECT_STREAM_MODE");
+    const char * local_odirect_stream_endpoint = std::getenv("GGML_LOCAL_ODIRECT_STREAM_ENDPOINT");
+    const char * local_odirect_stream_mode = std::getenv("GGML_LOCAL_ODIRECT_STREAM_MODE");
+    const bool rpc_odirect_process_direct =
+        rpc_odirect_stream_mode != nullptr && strcmp(rpc_odirect_stream_mode, "local") == 0;
+    const bool local_odirect_stream_direct =
+        local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
+        (local_odirect_stream_mode == nullptr || local_odirect_stream_mode[0] == '\0' || strcmp(local_odirect_stream_mode, "direct") == 0);
+    const bool local_odirect_process_direct =
+        local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0' &&
+        local_odirect_stream_mode != nullptr && strcmp(local_odirect_stream_mode, "local") == 0;
+
+    const size_t slice_bytes = (uma_loader_safe && uma_loader_slice_mib > 0) ? (size_t) uma_loader_slice_mib * MiB : 0;
+    const uint64_t min_available_bytes =
+        (uma_loader_safe && uma_loader_min_available_gib > 0) ? (uint64_t) uma_loader_min_available_gib * GiB : 0;
+    size_t slice_done = 0;
+    llama_psi_totals last_mem_psi_total = llama_memory_psi_totals();
+    llama_psi_totals phase_start_psi = last_mem_psi_total;
+    uint64_t phase_start_available = llama_mem_available_bytes();
+    const char * phase_buft_name = nullptr;
+    size_t local_direct_chunks = 0;
+    size_t local_direct_bytes = 0;
+    double local_direct_read_ms = 0.0;
+    double local_direct_set_ms = 0.0;
+#ifndef _WIN32
+    std::vector<int> local_odirect_fds(files.size(), -1);
+    std::vector<int> local_odirect_tail_fds(files.size(), -1);
+    auto get_local_odirect_fd = [&](int file_idx, bool tail) -> int {
+        auto & fds = tail ? local_odirect_tail_fds : local_odirect_fds;
+        if (file_idx < 0 || (size_t) file_idx >= fds.size()) {
+            return -1;
+        }
+        if (fds[file_idx] == -1) {
+            fds[file_idx] = ::open(files.at(file_idx)->path().c_str(), tail ? O_RDONLY : (O_RDONLY | O_DIRECT));
+        }
+        return fds[file_idx];
+    };
+#endif
+
+    auto uma_slice_gate = [&]() {
+        if (slice_bytes == 0 || slice_done < slice_bytes) {
+            return;
+        }
+
+        for (auto * event : events) {
+            ggml_backend_event_synchronize(event);
+        }
+
+        const llama_psi_totals psi_before = last_mem_psi_total;
+        llama_psi_totals psi_now = llama_memory_psi_totals();
+        last_mem_psi_total = psi_now;
+        uint64_t available_now = llama_mem_available_bytes();
+
+        const bool psi_some_moved = psi_now.some > psi_before.some;
+        const bool psi_full_moved = psi_now.full > psi_before.full;
+        const bool psi_moved = psi_some_moved || psi_full_moved;
+        const bool low_available = min_available_bytes > 0 && available_now > 0 && available_now < min_available_bytes;
+
+        if (uma_loader_psi_gate > 0 && (psi_moved || low_available)) {
+            LLAMA_LOG_WARN("%s: UMA loader slice gate: psi some %" PRIu64 " -> %" PRIu64 ", full %" PRIu64 " -> %" PRIu64 ", MemAvailable %.2f GiB, waiting up to %u s%s%s%s\n",
+                    __func__, psi_before.some, psi_now.some, psi_before.full, psi_now.full,
+                    available_now / 1024.0 / 1024.0 / 1024.0, uma_loader_psi_gate,
+                    psi_some_moved ? " [psi_some]" : "",
+                    psi_full_moved ? " [psi_full]" : "",
+                    low_available ? " [available]" : "");
+
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(uma_loader_psi_gate);
+            do {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                const llama_psi_totals psi_next = llama_memory_psi_totals();
+                const uint64_t available_next = llama_mem_available_bytes();
+                const bool psi_stable = psi_next.some == psi_now.some && psi_next.full == psi_now.full;
+                const bool available_ok = min_available_bytes == 0 || available_next == 0 || available_next >= min_available_bytes;
+
+                if (psi_stable && available_ok) {
+                    break;
+                }
+                psi_now = psi_next;
+                last_mem_psi_total = psi_now;
+                available_now = available_next;
+            } while (std::chrono::steady_clock::now() < deadline);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        slice_done = 0;
+    };
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1530,13 +2061,26 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
+        if (phase_buft_name == nullptr && cur->buffer != nullptr) {
+            phase_buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer));
+            LLAMA_LOG_WARN("%s: UMA loader phase begin: buffer type = %s, psi some/full = %" PRIu64 "/%" PRIu64 ", MemAvailable %.2f GiB\n",
+                    __func__, phase_buft_name, phase_start_psi.some, phase_start_psi.full,
+                    phase_start_available / 1024.0 / 1024.0 / 1024.0);
+        }
+
         if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            size_t current_size_done = 0;
+            {
+                std::lock_guard<std::mutex> lock(size_done_mutex);
+                current_size_done = size_done;
+            }
+            if (!progress_callback((float) current_size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
         }
 
         size_t n_size = ggml_nbytes(cur);
+        bool slice_counted_in_chunks = false;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1572,14 +2116,115 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (uma_loader_safe) {
+                    file->advise_dontneed(weight->offs, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
                 }
             } else {
+                const char * cur_buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer));
+                const bool cur_is_rpc_buffer = strncmp(cur_buft_name, "RPC", 3) == 0;
+                if (!check_tensors && (local_odirect_stream_direct || local_odirect_process_direct) && !cur_is_rpc_buffer) {
+                    slice_counted_in_chunks = true;
+#ifndef _WIN32
+                    const size_t chunk_size = 64 * MiB;
+                    if (!logged_local_odirect_direct) {
+                        LLAMA_LOG_WARN("%s: UMA loader local O_DIRECT direct tensor-set path enabled, mode = %s, endpoint = %s, chunk = %.2f MiB, buffer type = %s\n",
+                                __func__, local_odirect_process_direct ? "local" : "stream",
+                                local_odirect_stream_endpoint, chunk_size / 1024.0 / 1024.0,
+                                cur_buft_name);
+                        logged_local_odirect_direct = true;
+                    }
+                    read_buf.resize(std::min(n_size, chunk_size));
+                    std::unique_ptr<void, llama_aligned_free> aligned_read_buf;
+                    void * aligned_read_raw = nullptr;
+                    const size_t aligned_read_size = chunk_size + 4096;
+                    if (local_odirect_process_direct) {
+                        const int ret = posix_memalign(&aligned_read_raw, 4096, aligned_read_size);
+                        if (ret != 0) {
+                            throw std::runtime_error(format("%s: posix_memalign failed with error %d", __func__, ret));
+                        }
+                        aligned_read_buf.reset(aligned_read_raw);
+                    }
+                    size_t data_read = 0;
+
+                    while (data_read < n_size) {
+                        const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
+                        const llama_psi_totals psi_before_read = llama_memory_psi_totals();
+                        const uint64_t available_before_read = llama_mem_available_bytes();
+                        const auto time_before_read = std::chrono::steady_clock::now();
+                        void * data_ptr = read_buf.data();
+                        if (local_odirect_process_direct) {
+                            const int fd = get_local_odirect_fd(weight->idx, false);
+                            const int tail_fd = get_local_odirect_fd(weight->idx, true);
+                            llama_odirect_rate_limit_local(data_to_copy);
+                            if (!llama_read_local_odirect(fd, tail_fd, file->size(), weight->offs + data_read, data_to_copy,
+                                        aligned_read_buf.get(), aligned_read_size, &data_ptr)) {
+                                throw std::runtime_error(format(
+                                            "%s: failed to read local O_DIRECT file %s",
+                                            __func__, file->path().c_str()));
+                            }
+                        } else {
+                            if (!llama_read_from_odirect_stream(local_odirect_stream_endpoint, file->path().c_str(),
+                                        weight->offs + data_read, read_buf.data(), data_to_copy)) {
+                                throw std::runtime_error(format(
+                                            "%s: failed to read from local O_DIRECT stream endpoint %s",
+                                            __func__, local_odirect_stream_endpoint));
+                            }
+                        }
+                        const auto time_after_read = std::chrono::steady_clock::now();
+                        const llama_psi_totals psi_after_read = llama_memory_psi_totals();
+                        const uint64_t available_after_read = llama_mem_available_bytes();
+
+                        const auto time_before_set = std::chrono::steady_clock::now();
+                        ggml_backend_tensor_set(cur, data_ptr, data_read, data_to_copy);
+                        const auto time_after_set = std::chrono::steady_clock::now();
+                        const llama_psi_totals psi_after_set = llama_memory_psi_totals();
+                        const uint64_t available_after_set = llama_mem_available_bytes();
+                        const double read_ms = std::chrono::duration<double, std::milli>(time_after_read - time_before_read).count();
+                        const double set_ms = std::chrono::duration<double, std::milli>(time_after_set - time_before_set).count();
+                        local_direct_chunks++;
+                        local_direct_bytes += data_to_copy;
+                        local_direct_read_ms += read_ms;
+                        local_direct_set_ms += set_ms;
+
+                        const bool read_psi_moved =
+                            psi_after_read.some > psi_before_read.some || psi_after_read.full > psi_before_read.full;
+                        const bool set_psi_moved =
+                            psi_after_set.some > psi_after_read.some || psi_after_set.full > psi_after_read.full;
+                        if (read_psi_moved || set_psi_moved) {
+                            LLAMA_LOG_WARN(
+                                    "%s: UMA local direct chunk PSI: tensor=%s buffer=%s file_idx=%d tensor_off=%zu file_off=%zu size=%.2f MiB "
+                                    "read_ms=%.3f set_ms=%.3f "
+                                    "read_psi some/full +%" PRIu64 "/+%" PRIu64 " set_psi some/full +%" PRIu64 "/+%" PRIu64 " "
+                                    "MemAvailable %.2f -> %.2f -> %.2f GiB%s%s\n",
+                                    __func__, ggml_get_name(cur), cur_buft_name, weight->idx, data_read,
+                                    weight->offs + data_read, data_to_copy / 1024.0 / 1024.0,
+                                    read_ms, set_ms,
+                                    psi_after_read.some >= psi_before_read.some ? psi_after_read.some - psi_before_read.some : 0,
+                                    psi_after_read.full >= psi_before_read.full ? psi_after_read.full - psi_before_read.full : 0,
+                                    psi_after_set.some >= psi_after_read.some ? psi_after_set.some - psi_after_read.some : 0,
+                                    psi_after_set.full >= psi_after_read.full ? psi_after_set.full - psi_after_read.full : 0,
+                                    available_before_read / 1024.0 / 1024.0 / 1024.0,
+                                    available_after_read / 1024.0 / 1024.0 / 1024.0,
+                                    available_after_set / 1024.0 / 1024.0 / 1024.0,
+                                    read_psi_moved ? " [read]" : "",
+                                    set_psi_moved ? " [set]" : "");
+                        }
+
+                        data_read += data_to_copy;
+                        slice_done += data_to_copy;
+                        uma_slice_gate();
+                    }
+#else
+                    throw std::runtime_error(format("%s: local O_DIRECT stream path is unavailable on this platform", __func__));
+#endif
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                } else if (upload_backend) {
+                    slice_counted_in_chunks = true;
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1602,8 +2247,31 @@ bool llama_model_loader::load_all_data(
                         // Wait for previous upload to complete before reusing buffer
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        // Read aligned chunk from file.
+                        const bool use_local_odirect_stream =
+                            local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0';
+                        if (use_local_odirect_stream) {
+#ifndef _WIN32
+                            if (!logged_local_odirect_stream) {
+                                LLAMA_LOG_WARN("%s: UMA loader local O_DIRECT stream read path enabled, endpoint = %s\n",
+                                        __func__, local_odirect_stream_endpoint);
+                                logged_local_odirect_stream = true;
+                            }
+                            if (!llama_read_from_odirect_stream(local_odirect_stream_endpoint, file->path().c_str(),
+                                        read_start + bytes_read, reinterpret_cast<void *>(ptr_dest_aligned), read_size)) {
+                                throw std::runtime_error(format(
+                                            "%s: failed to read from local O_DIRECT stream endpoint %s",
+                                            __func__, local_odirect_stream_endpoint));
+                            }
+#else
+                            throw std::runtime_error(format("%s: local O_DIRECT stream path is unavailable on this platform", __func__));
+#endif
+                        } else {
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                        }
+                        if (uma_loader_safe && !use_local_odirect_stream) {
+                            file->advise_dontneed(read_start + bytes_read, read_size);
+                        }
 
                         // Calculate actual data portion (excluding alignment padding)
                         uintptr_t ptr_data = ptr_dest_aligned;
@@ -1627,24 +2295,153 @@ bool llama_model_loader::load_all_data(
 
                         data_read += data_to_copy;
                         bytes_read += read_size;
+                        slice_done += data_to_copy;
+                        uma_slice_gate();
 
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    read_buf.resize(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    bool use_rpc_odirect_process_direct = false;
+#ifndef _WIN32
+                    if (!check_tensors && rpc_odirect_process_direct && cur_is_rpc_buffer) {
+                        const size_t chunk_size = 64 * MiB;
+                        void * aligned_read_raw = nullptr;
+                        const size_t aligned_read_size = chunk_size + 4096;
+                        const int ret = posix_memalign(&aligned_read_raw, 4096, aligned_read_size);
+                        if (ret != 0) {
+                            throw std::runtime_error(format("%s: posix_memalign failed with error %d", __func__, ret));
+                        }
+                        std::unique_ptr<void, llama_aligned_free> aligned_read_buf(aligned_read_raw);
+
+                        llama_rpc_odirect_read_state state {
+                            /*.fd                  =*/ get_local_odirect_fd(weight->idx, false),
+                            /*.tail_fd             =*/ get_local_odirect_fd(weight->idx, true),
+                            /*.file_size           =*/ file->size(),
+                            /*.file_offset         =*/ weight->offs,
+                            /*.copied              =*/ 0,
+                            /*.aligned_buffer      =*/ aligned_read_buf.get(),
+                            /*.aligned_buffer_size =*/ aligned_read_size,
+                            /*.read_ms             =*/ 0.0,
+                            /*.chunks              =*/ 0,
+                        };
+                        if (state.fd < 0 || state.tail_fd < 0) {
+                            throw std::runtime_error(format("%s: failed to open local O_DIRECT file %s", __func__, file->path().c_str()));
+                        }
+                        if (!logged_rpc_odirect_stream) {
+                            LLAMA_LOG_WARN("%s: UMA loader RPC in-process O_DIRECT stream path enabled, chunk = %.2f MiB, buffer type = %s\n",
+                                    __func__, chunk_size / 1024.0 / 1024.0,
+                                    ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)));
+                            logged_rpc_odirect_stream = true;
+                        }
+
+                        const auto time_before_rpc = std::chrono::steady_clock::now();
+                        if (!ggml_backend_rpc_buffer_set_tensor_from_callback(
+                                    cur->buffer, cur, 0, n_size, &state, llama_rpc_odirect_read_callback)) {
+                            throw std::runtime_error(format("%s: failed to stream local O_DIRECT file %s to RPC tensor",
+                                        __func__, file->path().c_str()));
+                        }
+                        const auto time_after_rpc = std::chrono::steady_clock::now();
+                        const double total_ms = std::chrono::duration<double, std::milli>(time_after_rpc - time_before_rpc).count();
+                        LLAMA_LOG_WARN("%s: UMA RPC in-process O_DIRECT tensor timing: tensor=%s chunks=%zu bytes=%.2f GiB read=%.3f s send_set_total=%.3f s effective=%.3f GiB/s\n",
+                                __func__, ggml_get_name(cur), state.chunks, n_size / 1024.0 / 1024.0 / 1024.0,
+                                state.read_ms / 1000.0, total_ms / 1000.0,
+                                total_ms > 0.0 ? (n_size / 1024.0 / 1024.0 / 1024.0) / (total_ms / 1000.0) : 0.0);
+
+                        use_rpc_odirect_process_direct = true;
+                        slice_counted_in_chunks = true;
+                        slice_done += n_size;
+                        uma_slice_gate();
+                    }
+#else
+                    if (rpc_odirect_process_direct) {
+                        throw std::runtime_error(format("%s: RPC in-process O_DIRECT path is unavailable on this platform", __func__));
+                    }
+#endif
+                    const bool use_rpc_odirect_stream =
+                        !check_tensors &&
+                        !use_rpc_odirect_process_direct &&
+                        !rpc_odirect_process_direct &&
+                        rpc_odirect_stream_endpoint != nullptr &&
+                        rpc_odirect_stream_endpoint[0] != '\0' &&
+                        ggml_backend_rpc_buffer_set_tensor_from_file(
+                                cur->buffer, cur, rpc_odirect_stream_endpoint, file->path().c_str(), weight->offs, 0, n_size);
+                    if (use_rpc_odirect_process_direct) {
+                        // already streamed through the existing RPC connection above
+                    } else if (use_rpc_odirect_stream) {
+                        slice_counted_in_chunks = true;
+                        if (!logged_rpc_odirect_stream) {
+                            LLAMA_LOG_WARN("%s: UMA loader RPC O_DIRECT stream path enabled, endpoint = %s, buffer type = %s\n",
+                                    __func__, rpc_odirect_stream_endpoint,
+                                    ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)));
+                            logged_rpc_odirect_stream = true;
+                        }
+                        slice_done += n_size;
+                        uma_slice_gate();
+                    } else if (check_tensors) {
+                        read_buf.resize(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                        if (uma_loader_safe) {
+                            file->advise_dontneed(weight->offs, n_size);
+                        }
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (!ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                    } else {
+                        slice_counted_in_chunks = true;
+                        const size_t chunk_size = std::max<size_t>(buffer_size, 64 * MiB);
+                        if (!logged_chunked_tensor_set) {
+                            LLAMA_LOG_WARN("%s: UMA loader chunked backend tensor set fallback enabled, chunk = %.2f MiB, buffer type = %s\n",
+                                    __func__, chunk_size / 1024.0 / 1024.0,
+                                    ggml_backend_buft_name(ggml_backend_buffer_get_type(cur->buffer)));
+                            logged_chunked_tensor_set = true;
+                        }
+                        read_buf.resize(std::min(n_size, chunk_size));
+                        size_t data_read = 0;
+
+                        while (data_read < n_size) {
+                            const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
+                            file->seek(weight->offs + data_read, SEEK_SET);
+                            file->read_raw(read_buf.data(), data_to_copy);
+                            if (uma_loader_safe) {
+                                file->advise_dontneed(weight->offs + data_read, data_to_copy);
+                            }
+
+                            ggml_backend_tensor_set(cur, read_buf.data(), data_read, data_to_copy);
+
+                            data_read += data_to_copy;
+                            slice_done += data_to_copy;
+                            uma_slice_gate();
+                        }
                     }
                 }
             }
         }
 
-        size_done += n_size;
+        {
+            std::lock_guard<std::mutex> lock(size_done_mutex);
+            size_done += n_size;
+        }
+        if (!slice_counted_in_chunks) {
+            slice_done += n_size;
+            uma_slice_gate();
+        }
     }
+
+#ifndef _WIN32
+    for (int fd : local_odirect_fds) {
+        if (fd != -1) {
+            ::close(fd);
+        }
+    }
+    for (int fd : local_odirect_tail_fds) {
+        if (fd != -1) {
+            ::close(fd);
+        }
+    }
+#endif
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
@@ -1655,6 +2452,27 @@ bool llama_model_loader::load_all_data(
         ggml_backend_buffer_free(buf);
     }
     ggml_backend_free(upload_backend);
+
+    const llama_psi_totals phase_end_psi = llama_memory_psi_totals();
+    const uint64_t phase_end_available = llama_mem_available_bytes();
+    if (phase_buft_name != nullptr) {
+        LLAMA_LOG_WARN("%s: UMA loader phase end: buffer type = %s, psi some/full delta = +%" PRIu64 "/+%" PRIu64 ", MemAvailable %.2f -> %.2f GiB\n",
+                __func__, phase_buft_name,
+                phase_end_psi.some >= phase_start_psi.some ? phase_end_psi.some - phase_start_psi.some : 0,
+                phase_end_psi.full >= phase_start_psi.full ? phase_end_psi.full - phase_start_psi.full : 0,
+                phase_start_available / 1024.0 / 1024.0 / 1024.0,
+                phase_end_available / 1024.0 / 1024.0 / 1024.0);
+        if (local_direct_chunks > 0) {
+            const double total_ms = local_direct_read_ms + local_direct_set_ms;
+            LLAMA_LOG_WARN("%s: UMA local direct phase timing: buffer type = %s, chunks = %zu, bytes = %.2f GiB, read = %.3f s, tensor_set = %.3f s, total = %.3f s, effective = %.3f GiB/s\n",
+                    __func__, phase_buft_name, local_direct_chunks,
+                    local_direct_bytes / 1024.0 / 1024.0 / 1024.0,
+                    local_direct_read_ms / 1000.0,
+                    local_direct_set_ms / 1000.0,
+                    total_ms / 1000.0,
+                    total_ms > 0.0 ? (local_direct_bytes / 1024.0 / 1024.0 / 1024.0) / (total_ms / 1000.0) : 0.0);
+        }
+    }
 
     // check validation results
     bool validation_failed = false;
@@ -1670,7 +2488,12 @@ bool llama_model_loader::load_all_data(
     }
 
     // check if this is the last call and do final cleanup
-    if (size_done >= size_data) {
+    bool all_data_loaded = false;
+    {
+        std::lock_guard<std::mutex> lock(size_done_mutex);
+        all_data_loaded = size_done >= size_data;
+    }
+    if (all_data_loaded) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

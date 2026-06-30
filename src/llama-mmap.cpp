@@ -388,6 +388,44 @@ struct llama_file::impl {
         return alignment;
     }
 
+    void advise_dontneed(size_t offset, size_t len) const {
+#ifdef __linux__
+        if (len == 0) {
+            return;
+        }
+        const int file_fd = fd != -1 ? fd : fileno(fp);
+        if (file_fd == -1) {
+            return;
+        }
+        const int ret = posix_fadvise(file_fd, (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED);
+        if (ret != 0) {
+            LLAMA_LOG_DEBUG("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(ret));
+        }
+#else
+        GGML_UNUSED(offset);
+        GGML_UNUSED(len);
+#endif
+    }
+
+    void advise_noreuse(size_t offset, size_t len) const {
+#ifdef __linux__
+        if (len == 0) {
+            return;
+        }
+        const int file_fd = fd != -1 ? fd : fileno(fp);
+        if (file_fd == -1) {
+            return;
+        }
+        const int ret = posix_fadvise(file_fd, (off_t) offset, (off_t) len, POSIX_FADV_NOREUSE);
+        if (ret != 0) {
+            LLAMA_LOG_DEBUG("warning: posix_fadvise(.., POSIX_FADV_NOREUSE) failed: %s\n", strerror(ret));
+        }
+#else
+        GGML_UNUSED(offset);
+        GGML_UNUSED(len);
+#endif
+    }
+
     size_t alignment = 1;
 
     FILE * fp{};
@@ -404,9 +442,12 @@ llama_file::~llama_file() = default;
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
+const std::string & llama_file::path() const { return pimpl->fname; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+void llama_file::advise_dontneed(size_t offset, size_t len) const { pimpl->advise_dontneed(offset, len); }
+void llama_file::advise_noreuse(size_t offset, size_t len) const { pimpl->advise_noreuse(offset, len); }
 
 int llama_file::file_id() const {
 #ifdef _WIN32
@@ -442,24 +483,32 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, bool uma_loader_safe) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        if (uma_loader_safe) {
+            const int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE);
+            if (ret != 0) {
+                LLAMA_LOG_DEBUG("warning: posix_fadvise(.., POSIX_FADV_NOREUSE) failed: %s\n",
+                        strerror(ret));
+            }
+        } else {
+            if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                        strerror(errno));
+            }
+            if (prefetch) { flags |= MAP_POPULATE; }
         }
-        if (prefetch) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        if (prefetch > 0) {
+        if (prefetch > 0 && !uma_loader_safe) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
                         strerror(errno));
@@ -533,8 +582,9 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, bool uma_loader_safe) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(uma_loader_safe);
 
         size = file->size();
 
@@ -597,10 +647,11 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, bool uma_loader_safe) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
+        GGML_UNUSED(uma_loader_safe);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -617,7 +668,8 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa, bool uma_loader_safe) :
+    pimpl(std::make_unique<impl>(file, prefetch, numa, uma_loader_safe)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }

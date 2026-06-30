@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -77,6 +78,12 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool uma_loader_safe = false;
+    uint32_t uma_loader_slice_mib = 0;
+    uint32_t uma_loader_psi_gate = 0;
+    uint32_t uma_loader_min_available_gib = 0;
+    uint32_t uma_loader_buffer_slice_layers = 0;
+    uint32_t uma_loader_upload_chunk_mib = 0;
     bool check_tensors;
     bool no_alloc;
 
@@ -101,16 +108,26 @@ struct llama_model_loader {
 
     size_t size_done = 0;
     size_t size_data = 0;
+    std::mutex size_done_mutex;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    struct ctx_key {
+        ggml_backend_buffer_type_t buft;
+        int32_t slice;
+    };
+
+    // define a comparator for the ctx map to ensure that the order is well-defined:
+    struct ctx_key_comparator {
+        bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            const int cmp = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (cmp != 0) {
+                return cmp < 0;
+            }
+            return lhs.slice < rhs.slice;
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -128,6 +145,12 @@ struct llama_model_loader {
         FILE * file,
         bool use_mmap,
         bool use_direct_io,
+        bool uma_loader_safe,
+        uint32_t uma_loader_slice_mib,
+        uint32_t uma_loader_psi_gate,
+        uint32_t uma_loader_min_available_gib,
+        uint32_t uma_loader_buffer_slice_layers,
+        uint32_t uma_loader_upload_chunk_mib,
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
