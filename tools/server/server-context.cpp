@@ -29,9 +29,10 @@
 #include <thread>
 #include <chrono>
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -49,7 +50,7 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 static std::string env_str(const char * name, const std::string & fallback = "") {
     const char * value = std::getenv(name);
     return value != nullptr ? std::string(value) : fallback;
@@ -105,6 +106,10 @@ public:
             return false;
         }
         if (pid == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (getppid() == 1) {
+                _exit(127);
+            }
             setsid();
             int fd = -1;
             if (!log.empty()) {
@@ -1344,7 +1349,7 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-#if !defined(_WIN32)
+#if defined(__linux__)
         server_odirect_stream_scope odirect_stream_scope;
         if (!odirect_stream_scope.start_from_env()) {
             SRV_ERR("%s", "failed to start O_DIRECT streamer child process\n");

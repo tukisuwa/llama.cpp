@@ -17,7 +17,7 @@
 #include <mutex>
 #include <regex>
 #include <thread>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -77,7 +77,7 @@ static uint64_t llama_mem_available_bytes() {
     return 0;
 }
 
-#ifndef _WIN32
+#if defined(__linux__)
 static uint64_t llama_htonll(uint64_t v) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return (static_cast<uint64_t>(htonl(static_cast<uint32_t>(v))) << 32) | htonl(static_cast<uint32_t>(v >> 32));
@@ -2038,7 +2038,7 @@ bool llama_model_loader::load_all_data(
     size_t local_direct_bytes = 0;
     double local_direct_read_ms = 0.0;
     double local_direct_set_ms = 0.0;
-#ifndef _WIN32
+#if defined(__linux__)
     std::vector<int> local_odirect_fds(files.size(), -1);
     std::vector<int> local_odirect_tail_fds(files.size(), -1);
     struct local_odirect_fd_resources {
@@ -2199,7 +2199,7 @@ bool llama_model_loader::load_all_data(
                 const bool cur_is_rpc_buffer = strncmp(cur_buft_name, "RPC", 3) == 0;
                 if (!check_tensors && (local_odirect_stream_direct || local_odirect_process_direct) && !cur_is_rpc_buffer) {
                     slice_counted_in_chunks = true;
-#ifndef _WIN32
+#if defined(__linux__)
                     const size_t chunk_size = 64 * MiB;
                     if (!logged_local_odirect_direct) {
                         LLAMA_LOG_WARN("%s: UMA loader local O_DIRECT direct tensor-set path enabled, mode = %s, endpoint = %s, chunk = %.2f MiB, buffer type = %s\n",
@@ -2320,7 +2320,7 @@ bool llama_model_loader::load_all_data(
                         const bool use_local_odirect_stream =
                             local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0';
                         if (use_local_odirect_stream) {
-#ifndef _WIN32
+#if defined(__linux__)
                             if (!logged_local_odirect_stream) {
                                 LLAMA_LOG_WARN("%s: UMA loader local O_DIRECT stream read path enabled, endpoint = %s\n",
                                         __func__, local_odirect_stream_endpoint);
@@ -2373,7 +2373,7 @@ bool llama_model_loader::load_all_data(
                     }
                 } else {
                     bool use_rpc_odirect_process_direct = false;
-#ifndef _WIN32
+#if defined(__linux__)
                     if (!check_tensors && rpc_odirect_process_direct && cur_is_rpc_buffer) {
                         const size_t chunk_size = 64 * MiB;
                         void * aligned_read_raw = nullptr;
@@ -2499,7 +2499,7 @@ bool llama_model_loader::load_all_data(
         }
     }
 
-#ifndef _WIN32
+#if defined(__linux__)
     local_odirect_fd_cleanup.cleanup();
 #endif
 
