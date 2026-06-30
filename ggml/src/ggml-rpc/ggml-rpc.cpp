@@ -107,6 +107,10 @@ struct rpc_server_version {
     uint8_t patch;
 };
 
+static bool rpc_server_supports_set_tensor_from_file(const rpc_server_version & version) {
+    return version.major == RPC_PROTO_MAJOR_VERSION && (version.minor > 0 || version.patch >= 2);
+}
+
 struct rpc_msg_device_count_rsp {
     uint32_t device_count;
 };
@@ -409,9 +413,7 @@ static std::unordered_map<std::string, rpc_server_version> & rpc_endpoint_versio
 static bool rpc_endpoint_supports_set_tensor_from_file(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
     auto it = rpc_endpoint_versions().find(endpoint);
-    return it != rpc_endpoint_versions().end() &&
-        it->second.major == RPC_PROTO_MAJOR_VERSION &&
-        (it->second.minor > 0 || it->second.patch >= 2);
+    return it != rpc_endpoint_versions().end() && rpc_server_supports_set_tensor_from_file(it->second);
 }
 
 static bool rpc_validate_tensor_range(
@@ -458,6 +460,9 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::s
         std::lock_guard<std::mutex> lock(rpc_endpoint_versions_mutex());
         rpc_endpoint_versions()[endpoint] = rpc_server_version { response.major, response.minor, response.patch };
     }
+    GGML_LOG_INFO("RPC endpoint %s protocol %d.%d.%d, set_tensor_from_file=%s\n",
+                  endpoint.c_str(), response.major, response.minor, response.patch,
+                  rpc_server_supports_set_tensor_from_file({ response.major, response.minor, response.patch }) ? "yes" : "no");
     return true;
 }
 
@@ -670,6 +675,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_callback(
         ctx->sock->send_data(&rpc_tensor, sizeof(rpc_tensor)) &&
         ctx->sock->send_data(&offset, sizeof(offset));
     if (!status) {
+        GGML_LOG_ERROR("[%s] failed to send SET_TENSOR stream header; closing RPC socket\n", __func__);
         ctx->sock.reset();
         return false;
     }
@@ -678,8 +684,12 @@ bool ggml_backend_rpc_buffer_set_tensor_from_callback(
     size_t done = 0;
     while (done < size) {
         const size_t chunk = std::min<size_t>(chunk_buf.size(), size - done);
-        status = callback(user_data, chunk_buf.data(), chunk) && ctx->sock->send_data(chunk_buf.data(), chunk);
+        const bool read_ok = callback(user_data, chunk_buf.data(), chunk);
+        const bool send_ok = read_ok && ctx->sock->send_data(chunk_buf.data(), chunk);
+        status = read_ok && send_ok;
         if (!status) {
+            GGML_LOG_ERROR("[%s] SET_TENSOR stream failed at offset %zu/%zu (%s); closing RPC socket and aborting load\n",
+                           __func__, done, size, read_ok ? "send" : "read");
             ctx->sock.reset();
             return false;
         }
@@ -755,9 +765,13 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
     if (response.remote_ptr != 0) {
+        const bool supports_set_tensor_from_file = rpc_endpoint_supports_set_tensor_from_file(buft_ctx->endpoint);
+        GGML_LOG_INFO("RPC buffer %s size %.2f MiB, set_tensor_from_file=%s\n",
+                      buft_ctx->endpoint.c_str(), response.remote_size / 1024.0 / 1024.0,
+                      supports_set_tensor_from_file ? "yes" : "no");
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, rpc_endpoint_supports_set_tensor_from_file(buft_ctx->endpoint)},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, supports_set_tensor_from_file},
             response.remote_size);
         return buffer;
     } else {
@@ -1410,12 +1424,12 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input) {
         return false;
     }
     std::error_code ec;
-    const fs::path canonical_prefix = fs::weakly_canonical(fs::path(allowed_path_prefix), ec);
+    const fs::path canonical_prefix = fs::canonical(fs::path(allowed_path_prefix), ec);
     if (ec) {
         GGML_LOG_ERROR("[%s] RPC O_DIRECT stream path prefix rejected: %s\n", __func__, allowed_path_prefix);
         return false;
     }
-    const fs::path canonical_path = fs::weakly_canonical(fs::path(path), ec);
+    const fs::path canonical_path = fs::canonical(fs::path(path), ec);
     if (ec) {
         GGML_LOG_ERROR("[%s] RPC O_DIRECT stream path rejected: %s\n", __func__, path.c_str());
         return false;
