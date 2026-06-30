@@ -83,8 +83,7 @@ static llama_uma_buffer_load_order llama_model_env_load_order() {
     if (std::strcmp(value, "parallel") == 0) {
         return LLAMA_UMA_BUFFER_LOAD_ORDER_PARALLEL;
     }
-    LLAMA_LOG_ERROR("%s: invalid LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER=%s\n", __func__, value);
-    return LLAMA_UMA_BUFFER_LOAD_ORDER_DEFAULT;
+    throw std::runtime_error(format("%s: invalid LLAMA_UMA_LOADER_BUFFER_LOAD_ORDER=%s", __func__, value));
 }
 
 struct llama_model_psi_totals {

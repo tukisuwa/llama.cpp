@@ -80,6 +80,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_SET_TENSOR_FROM_FILE,
+    RPC_CMD_SET_TENSOR_STREAM,
     RPC_CMD_COUNT,
 };
 
@@ -307,6 +308,24 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
 static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
     uint64_t size;
     if (!sock->recv_data(&size, sizeof(size))) {
+        return false;
+    }
+    try {
+        input.resize(size);
+    } catch (const std::bad_alloc & e) {
+        GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
+        return false;
+    }
+    return sock->recv_data(input.data(), size);
+}
+
+static bool recv_msg_limited(socket_ptr sock, std::vector<uint8_t> & input, uint64_t max_size) {
+    uint64_t size;
+    if (!sock->recv_data(&size, sizeof(size))) {
+        return false;
+    }
+    if (size > max_size) {
+        GGML_LOG_ERROR("Rejecting RPC message of size %" PRIu64 " larger than limit %" PRIu64 "\n", size, max_size);
         return false;
     }
     try {
@@ -667,7 +686,7 @@ bool ggml_backend_rpc_buffer_set_tensor_from_callback(
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     const uint64_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
     const uint64_t offset = (uint64_t) tensor_offset;
-    uint8_t cmd_byte = RPC_CMD_SET_TENSOR;
+    uint8_t cmd_byte = RPC_CMD_SET_TENSOR_STREAM;
 
     bool status =
         ctx->sock->send_data(&cmd_byte, sizeof(cmd_byte)) &&
@@ -696,6 +715,11 @@ bool ggml_backend_rpc_buffer_set_tensor_from_callback(
         done += chunk;
     }
 
+    if (!recv_empty_msg(ctx->sock)) {
+        GGML_LOG_ERROR("[%s] SET_TENSOR_STREAM did not receive server completion ack; closing RPC socket\n", __func__);
+        ctx->sock.reset();
+        return false;
+    }
     return true;
 }
 
@@ -1323,9 +1347,14 @@ bool rpc_server::set_tensor_stream(socket_ptr sock, uint64_t input_size) {
 
     const size_t size = input_size - header_size;
 
-    // Preserve the original cache behavior when rpc-server local cache is enabled.
-    // The UMA-safe Step path disables this cache, so the common path below streams directly.
-    if (cache_dir && size > HASH_THRESHOLD) {
+    const bool odirect_stream_enabled =
+        std::getenv("GGML_RPC_ODIRECT_STREAM_ENABLE") != nullptr &&
+        std::strcmp(std::getenv("GGML_RPC_ODIRECT_STREAM_ENABLE"), "1") == 0;
+
+    // Preserve the original cache behavior when rpc-server local cache is enabled,
+    // except for UMA O_DIRECT streaming. That path must not materialize a full tensor
+    // receive buffer on the RPC server.
+    if (cache_dir && size > HASH_THRESHOLD && !odirect_stream_enabled) {
         std::vector<uint8_t> input;
         try {
             input.resize(input_size);
@@ -1339,6 +1368,9 @@ bool rpc_server::set_tensor_stream(socket_ptr sock, uint64_t input_size) {
             return false;
         }
         return set_tensor(input);
+    } else if (cache_dir && size > HASH_THRESHOLD && odirect_stream_enabled) {
+        GGML_LOG_WARN("[%s] bypassing RPC local cache for streaming tensor payload of size %zu because GGML_RPC_ODIRECT_STREAM_ENABLE=1\n",
+                __func__, size);
     }
 
     struct ggml_init_params params {
@@ -2062,6 +2094,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_STREAM: {
+                uint64_t input_size;
+                if (!sock->recv_data(&input_size, sizeof(input_size))) {
+                    return;
+                }
+                if (!server.set_tensor_stream(sock, input_size)) {
+                    return;
+                }
+                if (!send_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -2078,7 +2123,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_SET_TENSOR_FROM_FILE: {
                 std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                if (!recv_msg_limited(sock, input, 64 * 1024)) {
                     return;
                 }
                 if (!server.set_tensor_from_file(input)) {

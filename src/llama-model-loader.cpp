@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <fstream>
@@ -281,21 +283,37 @@ static bool llama_read_local_odirect(
     return copied == requested;
 }
 
-static double llama_env_double(const char * name, double fallback) {
+static double llama_env_nonnegative_double(const char * name, double fallback, double max_value) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
         return fallback;
     }
-    try {
-        return std::stod(value);
-    } catch (...) {
-        return fallback;
+    if (value[0] == '-' || value[0] == '+') {
+        throw std::runtime_error(format("%s: invalid non-negative value '%s'", name, value));
     }
+    errno = 0;
+    char * end = nullptr;
+    const double parsed = std::strtod(value, &end);
+    if (errno == ERANGE || end == value || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0 || parsed > max_value) {
+        throw std::runtime_error(format("%s: invalid non-negative value '%s'", name, value));
+    }
+    return parsed;
 }
 
 static bool llama_env_equals(const char * name, const char * expected) {
     const char * value = std::getenv(name);
     return value != nullptr && strcmp(value, expected) == 0;
+}
+
+static bool llama_odirect_scheduler_weighted_enabled() {
+    const char * value = std::getenv("GGML_ODIRECT_READ_SCHEDULER");
+    if (value == nullptr || value[0] == '\0' || strcmp(value, "none") == 0) {
+        return false;
+    }
+    if (strcmp(value, "weighted") == 0) {
+        return true;
+    }
+    throw std::runtime_error(format("GGML_ODIRECT_READ_SCHEDULER: invalid value '%s'", value));
 }
 
 static void llama_odirect_rate_limit_impl(size_t bytes, double limit_mibps, std::mutex & mutex, std::chrono::steady_clock::time_point & next_time) {
@@ -315,10 +333,10 @@ static void llama_odirect_rate_limit_impl(size_t bytes, double limit_mibps, std:
 }
 
 static bool llama_odirect_rate_limit_weighted(bool rpc, size_t bytes) {
-    static const bool enabled = llama_env_equals("GGML_ODIRECT_READ_SCHEDULER", "weighted");
-    static const double total_mibps = llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0);
-    static const double rpc_weight = llama_env_double("GGML_RPC_ODIRECT_READ_WEIGHT", 1.0);
-    static const double local_weight = llama_env_double("GGML_LOCAL_ODIRECT_READ_WEIGHT", 1.0);
+    static const bool enabled = llama_odirect_scheduler_weighted_enabled();
+    static const double total_mibps = llama_env_nonnegative_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0, 100000.0);
+    static const double rpc_weight = llama_env_nonnegative_double("GGML_RPC_ODIRECT_READ_WEIGHT", 1.0, 100000.0);
+    static const double local_weight = llama_env_nonnegative_double("GGML_LOCAL_ODIRECT_READ_WEIGHT", 1.0, 100000.0);
     static const double weight_sum = std::max(0.0, rpc_weight) + std::max(0.0, local_weight);
     static std::mutex global_mutex;
     static std::mutex rpc_mutex;
@@ -327,8 +345,11 @@ static bool llama_odirect_rate_limit_weighted(bool rpc, size_t bytes) {
     static auto rpc_next_time = std::chrono::steady_clock::now();
     static auto local_next_time = std::chrono::steady_clock::now();
 
-    if (!enabled || total_mibps <= 0.0 || weight_sum <= 0.0) {
+    if (!enabled) {
         return false;
+    }
+    if (total_mibps <= 0.0 || weight_sum <= 0.0) {
+        throw std::runtime_error("GGML_ODIRECT_READ_SCHEDULER=weighted requires positive total rate limit and at least one positive path weight");
     }
 
     const double path_weight = rpc ? std::max(0.0, rpc_weight) : std::max(0.0, local_weight);
@@ -346,9 +367,10 @@ static void llama_odirect_rate_limit_rpc(size_t bytes) {
     if (llama_odirect_rate_limit_weighted(true, bytes)) {
         return;
     }
-    static const double limit_mibps = llama_env_double(
+    static const double limit_mibps = llama_env_nonnegative_double(
             "GGML_RPC_ODIRECT_READ_RATE_LIMIT_MIBPS",
-            llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0));
+            llama_env_nonnegative_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0, 100000.0),
+            100000.0);
     static std::mutex mutex;
     static auto next_time = std::chrono::steady_clock::now();
     llama_odirect_rate_limit_impl(bytes, limit_mibps, mutex, next_time);
@@ -358,9 +380,10 @@ static void llama_odirect_rate_limit_local(size_t bytes) {
     if (llama_odirect_rate_limit_weighted(false, bytes)) {
         return;
     }
-    static const double limit_mibps = llama_env_double(
+    static const double limit_mibps = llama_env_nonnegative_double(
             "GGML_LOCAL_ODIRECT_READ_RATE_LIMIT_MIBPS",
-            llama_env_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0));
+            llama_env_nonnegative_double("GGML_ODIRECT_READ_RATE_LIMIT_MIBPS", 0.0, 100000.0),
+            100000.0);
     static std::mutex mutex;
     static auto next_time = std::chrono::steady_clock::now();
     llama_odirect_rate_limit_impl(bytes, limit_mibps, mutex, next_time);
@@ -2431,8 +2454,7 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_event_synchronize(events[buffer_idx]);
 
                         // Read aligned chunk from file.
-                        const bool use_local_odirect_stream =
-                            local_odirect_stream_endpoint != nullptr && local_odirect_stream_endpoint[0] != '\0';
+                        const bool use_local_odirect_stream = local_odirect_stream_async;
                         if (use_local_odirect_stream) {
 #if defined(__linux__)
                             if (!logged_local_odirect_stream) {
@@ -2450,11 +2472,13 @@ bool llama_model_loader::load_all_data(
                             throw std::runtime_error(format("%s: local O_DIRECT stream path is unavailable on this platform", __func__));
 #endif
                         } else {
+                            if (uma_loader_safe) {
+                                throw std::runtime_error(format(
+                                            "%s: UMA safe loader refuses buffered async-upload read fallback for tensor %s",
+                                            __func__, ggml_get_name(cur)));
+                            }
                             read_file_raw_locked(weight->idx, read_start + bytes_read,
                                     reinterpret_cast<void *>(ptr_dest_aligned), read_size, true);
-                        }
-                        if (uma_loader_safe && !use_local_odirect_stream) {
-                            file->advise_dontneed(read_start + bytes_read, read_size);
                         }
 
                         // Calculate actual data portion (excluding alignment padding)
@@ -2577,20 +2601,27 @@ bool llama_model_loader::load_all_data(
                         slice_done += n_size;
                         uma_slice_gate();
                     } else if (check_tensors) {
+                        if (uma_loader_safe) {
+                            cancelled.store(true);
+                            throw std::runtime_error(format("%s: UMA safe loader does not allow buffered --check-tensors fallback", __func__));
+                        }
                         if (local_odirect_stream_async && !cur_is_rpc_buffer) {
                             cancelled.store(true);
                             throw std::runtime_error(format("%s: GGML_LOCAL_ODIRECT_STREAM_MODE=async cannot be used with tensor checking fallback", __func__));
                         }
                         read_buf.resize(n_size);
                         read_file_raw_locked(weight->idx, weight->offs, read_buf.data(), n_size, false);
-                        if (uma_loader_safe) {
-                            file->advise_dontneed(weight->offs, n_size);
-                        }
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                         if (!ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                         }
                     } else {
+                        if (uma_loader_safe) {
+                            cancelled.store(true);
+                            throw std::runtime_error(format(
+                                        "%s: UMA safe loader refuses buffered chunked read fallback for tensor %s",
+                                        __func__, ggml_get_name(cur)));
+                        }
                         if (local_odirect_stream_async && !cur_is_rpc_buffer) {
                             cancelled.store(true);
                             throw std::runtime_error(format("%s: GGML_LOCAL_ODIRECT_STREAM_MODE=async would fall back to buffered chunked reads", __func__));
@@ -2613,9 +2644,6 @@ bool llama_model_loader::load_all_data(
                             const size_t data_to_copy = std::min(chunk_size, n_size - data_read);
                             read_file_raw_locked(weight->idx, weight->offs + data_read,
                                     read_buf.data(), data_to_copy, false);
-                            if (uma_loader_safe) {
-                                file->advise_dontneed(weight->offs + data_read, data_to_copy);
-                            }
 
                             ggml_backend_tensor_set(cur, read_buf.data(), data_read, data_to_copy);
 
