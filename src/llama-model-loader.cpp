@@ -1960,6 +1960,34 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    struct async_upload_resources {
+        std::vector<ggml_backend_buffer_t> & host_buffers;
+        std::vector<ggml_backend_event_t> & events;
+        ggml_backend_t & upload_backend;
+
+        ~async_upload_resources() {
+            cleanup();
+        }
+
+        void cleanup() {
+            for (auto * event : events) {
+                ggml_backend_event_synchronize(event);
+                ggml_backend_event_free(event);
+            }
+            events.clear();
+
+            for (auto * buf : host_buffers) {
+                ggml_backend_buffer_free(buf);
+            }
+            host_buffers.clear();
+
+            if (upload_backend != nullptr) {
+                ggml_backend_free(upload_backend);
+                upload_backend = nullptr;
+            }
+        }
+    } async_upload_cleanup { host_buffers, events, upload_backend };
+
     if (upload_backend) {
         LLAMA_LOG_WARN("%s: using async uploads for device %s, buffer type %s, backend %s, staging buffers = %zu x %.2f MiB\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
@@ -2013,6 +2041,29 @@ bool llama_model_loader::load_all_data(
 #ifndef _WIN32
     std::vector<int> local_odirect_fds(files.size(), -1);
     std::vector<int> local_odirect_tail_fds(files.size(), -1);
+    struct local_odirect_fd_resources {
+        std::vector<int> & fds;
+        std::vector<int> & tail_fds;
+
+        ~local_odirect_fd_resources() {
+            cleanup();
+        }
+
+        static void close_all(std::vector<int> & values) {
+            for (int & fd : values) {
+                if (fd != -1) {
+                    ::close(fd);
+                    fd = -1;
+                }
+            }
+        }
+
+        void cleanup() {
+            close_all(fds);
+            close_all(tail_fds);
+        }
+    } local_odirect_fd_cleanup { local_odirect_fds, local_odirect_tail_fds };
+
     auto get_local_odirect_fd = [&](int file_idx, bool tail) -> int {
         auto & fds = tail ? local_odirect_tail_fds : local_odirect_fds;
         if (file_idx < 0 || (size_t) file_idx >= fds.size()) {
@@ -2449,27 +2500,10 @@ bool llama_model_loader::load_all_data(
     }
 
 #ifndef _WIN32
-    for (int fd : local_odirect_fds) {
-        if (fd != -1) {
-            ::close(fd);
-        }
-    }
-    for (int fd : local_odirect_tail_fds) {
-        if (fd != -1) {
-            ::close(fd);
-        }
-    }
+    local_odirect_fd_cleanup.cleanup();
 #endif
 
-    // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
-    }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
+    async_upload_cleanup.cleanup();
 
     const llama_psi_totals phase_end_psi = llama_memory_psi_totals();
     const uint64_t phase_end_available = llama_mem_available_bytes();
