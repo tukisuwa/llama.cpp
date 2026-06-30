@@ -3,8 +3,15 @@
 These examples show the environment variables used by the experimental UMA
 O_DIRECT loader branch.
 
-They intentionally use placeholders such as `/models/model.gguf`,
-`10.0.0.2`, and `/path/to/llama.cpp`. Adjust them before use.
+They intentionally use placeholders such as `/models/model.gguf` and
+`10.0.0.2`. Adjust them before use.
+
+Build the binaries first:
+
+```bash
+cmake -S . -B build-uma-rpc -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-uma-rpc --target llama-server ggml-rpc-server -j
+```
 
 Examples:
 
@@ -14,14 +21,24 @@ Examples:
   O_DIRECT reads.
 - `rpc-main-quiet.env`: main server with a shared weighted read budget.
 
-Typical usage:
+Start the remote RPC server first:
+
+```bash
+set -a
+. examples/uma-odirect-loader/rpc-server.env
+set +a
+
+./build-uma-rpc/bin/ggml-rpc-server -H 0.0.0.0 -p 50052
+```
+
+Then start the main `llama-server`:
 
 ```bash
 set -a
 . examples/uma-odirect-loader/rpc-main-fast.env
 set +a
 
-./build/bin/llama-server \
+./build-uma-rpc/bin/llama-server \
   -m "$MODEL" \
   --rpc "$RPC_ENDPOINT" \
   -ngl 999 \

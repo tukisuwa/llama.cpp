@@ -30,6 +30,20 @@ loader path was requested.
 
 ## Primary Mode
 
+Build with RPC enabled when you want multi-node loading:
+
+```bash
+cmake -S . -B build-uma-rpc -DGGML_RPC=ON -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-uma-rpc --target llama-server ggml-rpc-server -j
+```
+
+For single-node testing, RPC is not required:
+
+```bash
+cmake -S . -B build-uma-local -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-uma-local --target llama-server -j
+```
+
 Enable safe mode with:
 
 ```bash
@@ -61,7 +75,7 @@ streamer:
 ```bash
 GGML_LOCAL_ODIRECT_STREAM_ENDPOINT=local \
 GGML_LOCAL_ODIRECT_STREAM_MODE=local \
-./build/bin/llama-server \
+./build-uma-local/bin/llama-server \
   -m /models/model.gguf \
   -ngl 999 \
   --uma-loader-safe \
@@ -91,7 +105,7 @@ For the RPC server, enable the O_DIRECT stream extension explicitly:
 GGML_RPC_ODIRECT_STREAM_ENABLE=1 \
 GGML_RPC_ODIRECT_STREAM_ALLOW_ENDPOINT=127.0.0.1:50152 \
 GGML_RPC_ODIRECT_STREAM_PATH_PREFIX=/models/ \
-./build/bin/rpc-server -H 0.0.0.0 -p 50052
+./build-uma-rpc/bin/ggml-rpc-server -H 0.0.0.0 -p 50052
 ```
 
 `GGML_RPC_ODIRECT_STREAM_ALLOW_ENDPOINT` and
@@ -107,7 +121,7 @@ GGML_RPC_ODIRECT_STREAM_ENDPOINT=local \
 GGML_RPC_ODIRECT_STREAM_MODE=local \
 GGML_LOCAL_ODIRECT_STREAM_ENDPOINT=local \
 GGML_LOCAL_ODIRECT_STREAM_MODE=local \
-./build/bin/llama-server \
+./build-uma-rpc/bin/llama-server \
   -m /models/model.gguf \
   --rpc 10.0.0.2:50052 \
   -ngl 999 \
@@ -172,7 +186,7 @@ Before loading a very large model on UMA:
 free -h
 cat /proc/pressure/memory
 cat /proc/pressure/io
-pgrep -af 'llama-server|rpc-server|vllm|sglang|python.*api_server' || true
+pgrep -af 'llama-server|ggml-rpc-server|vllm|sglang|python.*api_server' || true
 ```
 
 Treat any nonzero memory PSI during load as a failed load, even if
@@ -182,7 +196,7 @@ loader is forcing reclaim/stall in the same RAM pool needed by the model.
 Do not use:
 
 - `--mlock` for very large mmap-backed loads on memory-tight UMA systems
-- RPC local cache (`rpc-server -c`) unless you intentionally want file-cache
+- RPC local cache (`ggml-rpc-server -c`) unless you intentionally want file-cache
   residency on the RPC node
 - fail-open gate settings for production loads
 
