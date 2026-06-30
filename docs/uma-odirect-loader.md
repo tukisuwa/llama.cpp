@@ -110,6 +110,15 @@ RPC tensor streaming, RPC cache disabled, `remote-first` buffer loading, and a
 local read limit of `3000 MiB/s`, loaded the same class of model in `0:51.612`
 with swap at `0` and memory PSI at `0.00/0.00` on both nodes.
 
+Representative runs:
+
+| loader path | model loaded | memory PSI | swap | local IO PSI | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| standard / page-cache-heavy | `5:51`-`6:02` | severe local PSI in at least one run | not the limiting signal | not comparable | API ready was not a safe success criterion |
+| standard-style UMA-tuned, no O_DIRECT streaming | about `3:12` | `0.00/0.00` in the clean run | `0` | not the focus | lower pressure, but still no O_DIRECT tensor streaming |
+| UMA O_DIRECT safety profile | `1:42.562` | `0.00/0.00` | `0` | `4.50/4.49` | weighted read budget, lower IO pressure |
+| UMA O_DIRECT fast profile | `0:51.612` | `0.00/0.00` | `0` | `24.44/24.44` | in-process O_DIRECT + RPC tensor streaming |
+
 That result is not just a speedup. The important change is that the loader does
 not silently return to mmap/page-cache/full-buffer fallback paths after the user
 has explicitly requested the UMA-safe path.
